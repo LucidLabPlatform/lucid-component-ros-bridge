@@ -1,0 +1,50 @@
+# ROS-MQTT Bridge Configuration
+# ──────────────────────────────
+# This file defines how ROS 1 topics map to LUCID MQTT topics.
+# Edit this file to match your robot's ROS topic layout.
+#
+# msg_type format: "package/MessageType" (standard ROS 1 convention)
+#   e.g. "geometry_msgs/Twist", "nav_msgs/Odometry", "sensor_msgs/LaserScan"
+
+node_name: lucid_ros_bridge
+
+# ── Auto-discovery ──────────────────────────────────────────────────────
+# When true, the bridge queries the ROS master at startup for all published
+# topics and automatically bridges them (subscribe + publish).
+# Explicit ros_subscriptions/ros_publishers below are merged in and take
+# priority over discovered entries for the same topic.
+auto_discover: true
+
+# Topics to skip during auto-discovery. Only used when auto_discover is true.
+# Example:
+# exclude_topics:
+#   - /rosout
+#   - /rosout_agg
+#   - /clock
+exclude_topics: []
+
+# ── Explicit mappings ───────────────────────────────────────────────────
+# These are always bridged regardless of auto_discover.
+# When auto_discover is true, these override any discovered entry for the
+# same ROS topic (e.g. to use a custom telemetry_metric name).
+
+# ROS topics → LUCID telemetry
+# Each entry subscribes to a ROS topic and forwards messages as LUCID telemetry.
+# The telemetry appears at: lucid/agents/{agent_id}/components/ros_bridge/telemetry/{metric}
+ros_subscriptions: []
+  # - ros_topic: /odom
+  #   msg_type: nav_msgs/Odometry
+  #   telemetry_metric: odom
+
+  # - ros_topic: /battery_state
+  #   msg_type: sensor_msgs/BatteryState
+  #   telemetry_metric: battery
+
+# LUCID commands → ROS topic publishes
+# Each entry registers a LUCID command that, when received, publishes to a ROS topic.
+# Send commands to: lucid/agents/{agent_id}/components/ros_bridge/cmd/{command}
+# Payload format:   {"request_id": "...", "data": {<ros message fields>}}
+ros_publishers: []
+  # - ros_topic: /cmd_vel
+  #   msg_type: geometry_msgs/Twist
+  #   command: cmd_vel

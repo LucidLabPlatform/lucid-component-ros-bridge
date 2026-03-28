@@ -1,0 +1,5 @@
+lucid-component-base @ git+https://github.com/LucidLabPlatform/lucid-component-base@v1.1.3
+pyyaml>=6.0
+
+[dev]
+pytest

@@ -1,0 +1,783 @@
+"""
+Extended coverage tests for the ROS Bridge component.
+
+Covers paths not reached by test_contract.py:
+  - handle_ros_publish (success, unknown command, publish exception)
+  - __getattr__ routing for configured ros_publishers
+  - _msg_to_dict with nested messages and list fields
+  - _dict_to_msg with nested messages (fallback path)
+  - _discover_ros_topics when ROS master query raises
+  - _resolve_msg_type both formats (slash and dotted)
+  - _load_bridge_config working-directory fallback
+  - on_cmd_reset publishes result
+  - on_cmd_ping with malformed JSON
+  - on_cmd_cfg_set with no recognised keys (noop applied)
+  - get_state_payload after values are populated
+  - get_cfg_payload with exclude_topics populated
+  - metadata with zero subs/pubs
+  - Component stop from RUNNING state via mock rospy
+  - _spin_loop exit via stop_event
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import textwrap
+import threading
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
+
+import pytest
+from lucid_component_base import ComponentContext, ComponentStatus
+
+from lucid_component_ros_bridge import RosBridgeComponent
+from lucid_component_ros_bridge.component import (
+    _dict_to_msg,
+    _discover_ros_topics,
+    _load_bridge_config,
+    _msg_to_dict,
+    _resolve_msg_type,
+    _topic_to_command,
+    _topic_to_metric,
+    _utc_iso,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class FakeMqtt:
+    def __init__(self) -> None:
+        self.published: list[tuple] = []
+
+    def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False) -> None:
+        self.published.append((topic, payload, qos, retain))
+
+
+def _fake_context(config: dict | None = None) -> ComponentContext:
+    mqtt = FakeMqtt()
+    ctx = ComponentContext.create(
+        agent_id="test-agent",
+        base_topic="lucid/agents/test-agent",
+        component_id="ros_bridge",
+        mqtt=mqtt,
+        config=config or {},
+    )
+    return ctx
+
+
+def _write_yaml(tmp_path: Path, content: str) -> Path:
+    p = tmp_path / "ros_bridge.yaml"
+    p.write_text(textwrap.dedent(content), encoding="utf-8")
+    return p
+
+
+def _comp_with_publishers(tmp_path: Path) -> RosBridgeComponent:
+    """Return a component configured with one ros_publisher."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_bot
+        ros_subscriptions: []
+        ros_publishers:
+          - ros_topic: /cmd_vel
+            msg_type: geometry_msgs/Twist
+            command: cmd_vel
+    """)
+    return RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+
+
+# ---------------------------------------------------------------------------
+# _utc_iso
+# ---------------------------------------------------------------------------
+
+def test_utc_iso_returns_string():
+    ts = _utc_iso()
+    assert isinstance(ts, str)
+    assert "T" in ts
+
+
+# ---------------------------------------------------------------------------
+# _topic_to_metric / _topic_to_command edge cases
+# ---------------------------------------------------------------------------
+
+def test_topic_to_metric_already_no_slash():
+    assert _topic_to_metric("odom") == "odom"
+
+
+def test_topic_to_metric_deep_path():
+    assert _topic_to_metric("/a/b/c/d") == "a_b_c_d"
+
+
+def test_topic_to_command_deep_path():
+    assert _topic_to_command("/arm/joint/1") == "arm_joint_1"
+
+
+# ---------------------------------------------------------------------------
+# _load_bridge_config — working-directory fallback
+# ---------------------------------------------------------------------------
+
+def test_load_bridge_config_working_dir_fallback(tmp_path: Path, monkeypatch):
+    """When no config_path is given and there is a ros_bridge.yaml in cwd, use it."""
+    yaml_content = textwrap.dedent("""\
+        node_name: cwd_bot
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    cwd_yaml = tmp_path / "ros_bridge.yaml"
+    cwd_yaml.write_text(yaml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    cfg = _load_bridge_config({})
+    assert cfg["node_name"] == "cwd_bot"
+
+
+def test_load_bridge_config_no_file_returns_empty(tmp_path: Path, monkeypatch):
+    """When neither override nor working-dir yaml nor package default exists, return {}."""
+    monkeypatch.chdir(tmp_path)
+    # Patch _DEFAULT_CONFIG_PATH to a nonexistent file
+    with patch(
+        "lucid_component_ros_bridge.component._DEFAULT_CONFIG_PATH",
+        tmp_path / "nonexistent.yaml",
+    ):
+        cfg = _load_bridge_config({})
+    assert cfg == {}
+
+
+# ---------------------------------------------------------------------------
+# _resolve_msg_type
+# ---------------------------------------------------------------------------
+
+def test_resolve_msg_type_slash_format(monkeypatch):
+    """geometry_msgs/Twist → import geometry_msgs.msg, getattr Twist."""
+    fake_module = MagicMock()
+    fake_class = MagicMock()
+    fake_module.Twist = fake_class
+    with patch.dict("sys.modules", {"geometry_msgs.msg": fake_module}):
+        result = _resolve_msg_type("geometry_msgs/Twist")
+    assert result is fake_class
+
+
+def test_resolve_msg_type_dotted_format(monkeypatch):
+    """geometry_msgs.msg.Twist → same result via dotted import."""
+    fake_module = MagicMock()
+    fake_class = MagicMock()
+    fake_module.Twist = fake_class
+    with patch.dict("sys.modules", {"geometry_msgs.msg": fake_module}):
+        result = _resolve_msg_type("geometry_msgs.msg.Twist")
+    assert result is fake_class
+
+
+def test_resolve_msg_type_import_error_propagates():
+    """If the module doesn't exist, ImportError propagates."""
+    with pytest.raises(ModuleNotFoundError):
+        _resolve_msg_type("nonexistent_pkg/Msg")
+
+
+# ---------------------------------------------------------------------------
+# _msg_to_dict — nested and list fields
+# ---------------------------------------------------------------------------
+
+def test_msg_to_dict_nested_message():
+    """Nested ROS messages (objects with __slots__ and _type) are recursed."""
+    class Inner:
+        __slots__ = ["z"]
+        _type = "std_msgs/Float32"
+        def __init__(self):
+            self.z = 9.9
+
+    class Outer:
+        __slots__ = ["inner_field"]
+        def __init__(self):
+            self.inner_field = Inner()
+
+    with patch.dict("sys.modules", {"rospy_message_converter": None}):
+        result = _msg_to_dict(Outer())
+
+    assert isinstance(result["inner_field"], dict)
+    assert result["inner_field"]["z"] == 9.9
+
+
+def test_msg_to_dict_list_of_primitives():
+    class Msg:
+        __slots__ = ["values"]
+        def __init__(self):
+            self.values = [1, 2, 3]
+
+    with patch.dict("sys.modules", {"rospy_message_converter": None}):
+        result = _msg_to_dict(Msg())
+
+    assert result["values"] == [1, 2, 3]
+
+
+def test_msg_to_dict_list_of_messages():
+    """Lists containing nested ROS messages are recursed element-by-element."""
+    class Item:
+        __slots__ = ["v"]
+        def __init__(self, v):
+            self.v = v
+
+    class Container:
+        __slots__ = ["items"]
+        def __init__(self):
+            self.items = [Item(10), Item(20)]
+
+    with patch.dict("sys.modules", {"rospy_message_converter": None}):
+        result = _msg_to_dict(Container())
+
+    assert result["items"] == [{"v": 10}, {"v": 20}]
+
+
+def test_msg_to_dict_uses_message_converter_when_available():
+    fake_converter = MagicMock()
+    fake_converter.message_converter.convert_ros_message_to_dictionary.return_value = {
+        "x": 1.0
+    }
+    msg = MagicMock()
+    with patch.dict("sys.modules", {"rospy_message_converter": fake_converter}):
+        result = _msg_to_dict(msg)
+    assert result == {"x": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# _dict_to_msg — nested messages (fallback path)
+# ---------------------------------------------------------------------------
+
+def test_dict_to_msg_nested_message_fallback():
+    """Nested dicts map to nested message objects when fallback is used."""
+    class Inner:
+        __slots__ = ["z"]  # ROS messages use __slots__; required for recursive conversion
+        def __init__(self):
+            self.z = 0.0
+
+    class Outer:
+        def __init__(self):
+            self.inner = Inner()
+
+    with patch.dict("sys.modules", {"rospy_message_converter": None}):
+        result = _dict_to_msg({"inner": {"z": 7.7}}, Outer)
+
+    assert result.inner.z == 7.7
+
+
+def test_dict_to_msg_uses_message_converter_when_available():
+    fake_msg = MagicMock()
+    fake_converter = MagicMock()
+    fake_converter.message_converter.convert_dictionary_to_ros_message.return_value = fake_msg
+
+    class FakeType:
+        _type = "geometry_msgs/Twist"
+
+    with patch.dict("sys.modules", {"rospy_message_converter": fake_converter}):
+        result = _dict_to_msg({"linear": {}}, FakeType)
+
+    assert result is fake_msg
+
+
+def test_dict_to_msg_message_converter_missing_type_attr():
+    """If msg_type has no _type, message_converter path raises AttributeError → fallback."""
+    fake_converter_module = MagicMock()
+    fake_converter_module.message_converter.convert_dictionary_to_ros_message.side_effect = AttributeError
+
+    class FakeType:
+        def __init__(self):
+            self.x = 0.0
+
+    with patch.dict("sys.modules", {"rospy_message_converter": fake_converter_module}):
+        result = _dict_to_msg({"x": 5.5}, FakeType)
+
+    assert result.x == 5.5
+
+
+# ---------------------------------------------------------------------------
+# _discover_ros_topics — error path
+# ---------------------------------------------------------------------------
+
+def test_discover_ros_topics_master_query_fails():
+    """If get_published_topics raises, return empty lists."""
+    fake_rospy = MagicMock()
+    fake_rospy.get_published_topics.side_effect = Exception("connection refused")
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        subs, pubs = _discover_ros_topics(set(), set(), set())
+    assert subs == []
+    assert pubs == []
+
+
+# ---------------------------------------------------------------------------
+# handle_ros_publish
+# ---------------------------------------------------------------------------
+
+def test_handle_ros_publish_no_publisher_configured():
+    """Command with no matching publisher → result ok=False."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.handle_ros_publish("unknown_cmd", json.dumps({"request_id": "r1"}))
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/unknown_cmd/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is False
+    assert "unknown_cmd" in result_msgs[0]["error"]
+
+
+def test_handle_ros_publish_publish_exception(tmp_path: Path):
+    """If pub.publish raises, result is ok=False with error message."""
+    comp = _comp_with_publishers(tmp_path)
+
+    fake_pub = MagicMock()
+    fake_pub.publish.side_effect = RuntimeError("ROS not running")
+    fake_msg_type = MagicMock(return_value=MagicMock())
+
+    comp._ros_pubs["cmd_vel"] = fake_pub
+    comp._pub_msg_types["cmd_vel"] = fake_msg_type
+
+    comp.handle_ros_publish(
+        "cmd_vel",
+        json.dumps({"request_id": "r99", "data": {"linear": {"x": 1.0}}}),
+    )
+
+    ctx = comp.context
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cmd_vel/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is False
+    assert "ROS not running" in result_msgs[0]["error"]
+
+
+def test_handle_ros_publish_success(tmp_path: Path):
+    """Successful ROS publish → result ok=True."""
+    comp = _comp_with_publishers(tmp_path)
+
+    fake_pub = MagicMock()
+    fake_msg_instance = MagicMock()
+    fake_msg_type = MagicMock(return_value=fake_msg_instance)
+
+    comp._ros_pubs["cmd_vel"] = fake_pub
+    comp._pub_msg_types["cmd_vel"] = fake_msg_type
+
+    comp.handle_ros_publish(
+        "cmd_vel",
+        json.dumps({"request_id": "r10", "data": {"linear": {"x": 0.5}}}),
+    )
+
+    fake_pub.publish.assert_called_once()
+    ctx = comp.context
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cmd_vel/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is True
+
+
+def test_handle_ros_publish_malformed_json(tmp_path: Path):
+    """Malformed JSON payload → falls back gracefully, result ok=False (no pub)."""
+    comp = _comp_with_publishers(tmp_path)
+    # No actual publisher registered → no-pub branch, but exercises JSON parse error path
+    comp.handle_ros_publish("cmd_vel", "NOT_JSON")
+    ctx = comp.context
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cmd_vel/result" in t
+    ]
+    # No publisher set up, so result is the "no publisher" error
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# __getattr__ routing
+# ---------------------------------------------------------------------------
+
+def test_getattr_routes_to_handle_ros_publish(tmp_path: Path):
+    """on_cmd_<command> for a configured publisher is routed to handle_ros_publish."""
+    comp = _comp_with_publishers(tmp_path)
+
+    fake_pub = MagicMock()
+    fake_msg_type = MagicMock(return_value=MagicMock())
+    comp._ros_pubs["cmd_vel"] = fake_pub
+    comp._pub_msg_types["cmd_vel"] = fake_msg_type
+
+    # Access via __getattr__ (on_cmd_cmd_vel is not defined on the class)
+    handler = comp.on_cmd_cmd_vel
+    handler(json.dumps({"request_id": "r20", "data": {}}))
+
+    fake_pub.publish.assert_called_once()
+
+
+def test_getattr_on_cmd_not_in_ros_pubs_raises(tmp_path: Path):
+    """on_cmd_<command> for a command not in _ros_pubs raises AttributeError."""
+    comp = _comp_with_publishers(tmp_path)
+    # cmd_vel is configured but not wired up with a real pub — __getattr__ should
+    # return a handler because 'cmd_vel' IS in _ros_publishers config, but the
+    # publisher object is in _ros_pubs dict. Without a pub in _ros_pubs, the
+    # __getattr__ guard `command in self._ros_pubs` is False.
+    with pytest.raises(AttributeError):
+        _ = comp.on_cmd_completely_unknown_xyz
+
+
+# ---------------------------------------------------------------------------
+# Command handlers — edge cases
+# ---------------------------------------------------------------------------
+
+def test_cmd_reset_publishes_result():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_reset(json.dumps({"request_id": "reset-1"}))
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/reset/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is True
+    assert result_msgs[0]["request_id"] == "reset-1"
+
+
+def test_cmd_ping_malformed_json():
+    """on_cmd_ping with invalid JSON still publishes a result (empty request_id)."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_ping("NOT_JSON")
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/ping/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is True
+
+
+def test_cmd_reset_malformed_json():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp._latest_values["x"] = {"v": 1}
+    comp.on_cmd_reset("INVALID")
+    assert comp._latest_values == {}
+
+
+def test_cmd_cfg_set_no_recognised_keys():
+    """cfg/set with no recognised key → applied is None, ok=True."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r5", "set": {"unknown_key": 42}}))
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t
+    ]
+    assert len(result_msgs) == 1
+    assert result_msgs[0]["ok"] is True
+
+
+def test_cmd_cfg_set_empty_payload():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set("")
+    # Empty payload — should not crash; result published with empty request_id
+    result_msgs = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t
+    ]
+    assert len(result_msgs) == 1
+
+
+# ---------------------------------------------------------------------------
+# get_state_payload with populated latest_values
+# ---------------------------------------------------------------------------
+
+def test_get_state_payload_with_values():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp._latest_values["odom"] = {"x": 1.0, "y": 2.0}
+    state = comp.get_state_payload()
+    assert state["latest_values"]["odom"]["x"] == 1.0
+    assert state["subscriptions_active"] == 0  # subs not wired yet
+
+
+# ---------------------------------------------------------------------------
+# get_cfg_payload with exclude_topics
+# ---------------------------------------------------------------------------
+
+def test_get_cfg_payload_with_exclude_topics(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        auto_discover: true
+        exclude_topics:
+          - /rosout
+          - /clock
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    cfg = comp.get_cfg_payload()
+    assert "/rosout" in cfg["exclude_topics"]
+    assert "/clock" in cfg["exclude_topics"]
+    assert cfg["auto_discover"] is True
+
+
+# ---------------------------------------------------------------------------
+# metadata shape
+# ---------------------------------------------------------------------------
+
+def test_metadata_shape_default():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    meta = comp.metadata()
+    assert "component_id" in meta
+    assert "version" in meta
+    assert "node_name" in meta
+    assert meta["ros_subscriptions"] == []
+    assert meta["ros_publishers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Component start / stop lifecycle with mocked rospy
+# ---------------------------------------------------------------------------
+
+def _make_fake_rospy():
+    """Build a mock rospy module that behaves well enough for _start()/_stop()."""
+    fake_rospy = MagicMock()
+    fake_rospy.is_shutdown.return_value = False
+
+    # Rate mock: sleep does nothing
+    rate_mock = MagicMock()
+    rate_mock.sleep = MagicMock()
+    fake_rospy.Rate.return_value = rate_mock
+
+    # Subscriber mock
+    fake_rospy.Subscriber.return_value = MagicMock()
+    # Publisher mock
+    fake_rospy.Publisher.return_value = MagicMock()
+    return fake_rospy
+
+
+def test_start_runs_with_mocked_rospy(tmp_path: Path):
+    """Component starts successfully when rospy is mocked."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        comp.start()
+        assert comp.state.status == ComponentStatus.RUNNING
+        fake_rospy.init_node.assert_called_once()
+        comp.stop()
+
+
+def test_stop_after_start_with_mocked_rospy(tmp_path: Path):
+    """Component transitions to STOPPED after stop() when rospy is mocked."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    # Make is_shutdown return True immediately so spin loop exits fast
+    fake_rospy.is_shutdown.return_value = True
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        comp.start()
+        comp.stop()
+
+    assert comp.state.status == ComponentStatus.STOPPED
+
+
+def test_stop_idempotent_when_already_stopped():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    assert comp.state.status == ComponentStatus.STOPPED
+    comp.stop()  # Should not raise
+    assert comp.state.status == ComponentStatus.STOPPED
+
+
+def test_start_with_auto_discover_and_mocked_rospy(tmp_path: Path):
+    """auto_discover path is exercised: _discover_ros_topics is called."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: true
+        exclude_topics:
+          - /rosout
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_rospy.get_published_topics.return_value = [("/odom", "nav_msgs/Odometry")]
+
+    # _resolve_msg_type will try to import nav_msgs.msg — mock that too
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        comp.start()
+        assert comp.state.status == ComponentStatus.RUNNING
+        # One subscription should have been auto-discovered
+        assert len(comp._ros_subscriptions) == 1
+        assert comp._ros_subscriptions[0]["ros_topic"] == "/odom"
+        comp.stop()
+
+
+def test_start_with_ros_subscription_msg_type_resolution_failure(tmp_path: Path):
+    """If msg_type resolution fails for a subscription, it is skipped (component still starts)."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions:
+          - ros_topic: /bad
+            msg_type: nonexistent_pkg/Msg
+            telemetry_metric: bad_metric
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        comp.start()
+        assert comp.state.status == ComponentStatus.RUNNING
+        # Sub was skipped due to import error, so ros_subs list is empty
+        assert comp._ros_subs == []
+        comp.stop()
+
+
+def test_start_with_ros_publisher_msg_type_resolution_failure(tmp_path: Path):
+    """If msg_type resolution fails for a publisher, it is skipped (component still starts)."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers:
+          - ros_topic: /bad_pub
+            msg_type: nonexistent_pkg/Twist
+            command: bad_cmd
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        comp.start()
+        assert comp.state.status == ComponentStatus.RUNNING
+        assert comp._ros_pubs == {}
+        comp.stop()
+
+
+# ---------------------------------------------------------------------------
+# _spin_loop exits when stop_event is set
+# ---------------------------------------------------------------------------
+
+def test_spin_loop_exits_on_stop_event():
+    """_spin_loop terminates when _stop_event is set."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_rospy.is_shutdown.return_value = False
+
+    call_count = 0
+    def fake_sleep():
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            comp._stop_event.set()
+
+    fake_rospy.Rate.return_value.sleep = fake_sleep
+
+    comp._stop_event.clear()
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        t = threading.Thread(target=comp._spin_loop)
+        t.start()
+        t.join(timeout=3.0)
+
+    assert not t.is_alive()
+    assert call_count >= 2
+
+
+def test_spin_loop_exits_on_ros_interrupt():
+    """_spin_loop exits cleanly when rospy.ROSInterruptException is raised."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = MagicMock()
+    fake_rospy.is_shutdown.return_value = False
+
+    class FakeROSInterruptException(Exception):
+        pass
+
+    fake_rospy.ROSInterruptException = FakeROSInterruptException
+    fake_rate = MagicMock()
+    fake_rate.sleep.side_effect = FakeROSInterruptException("interrupted")
+    fake_rospy.Rate.return_value = fake_rate
+
+    comp._stop_event.clear()
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        t = threading.Thread(target=comp._spin_loop)
+        t.start()
+        t.join(timeout=3.0)
+
+    assert not t.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# Telemetry callback wiring (via ROS subscriber callback)
+# ---------------------------------------------------------------------------
+
+def test_ros_subscription_callback_publishes_telemetry(tmp_path: Path):
+    """When a ROS message is received, the callback publishes telemetry."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions:
+          - ros_topic: /odom
+            msg_type: nav_msgs/Odometry
+            telemetry_metric: odom
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
+
+    # Capture the subscriber callback so we can invoke it manually
+    captured_callbacks = []
+
+    def fake_subscriber(topic, msg_type, callback):
+        captured_callbacks.append(callback)
+        return MagicMock()
+
+    fake_rospy.Subscriber.side_effect = fake_subscriber
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        comp.start()
+
+        assert len(captured_callbacks) == 1
+
+        # Simulate a ROS message arriving
+        class FakeMsg:
+            __slots__ = ["x"]
+            def __init__(self):
+                self.x = 42.0
+
+        with patch.dict("sys.modules", {"rospy_message_converter": None}):
+            captured_callbacks[0](FakeMsg())
+
+        # latest_values should be updated
+        assert comp._latest_values["odom"] == {"x": 42.0}
+
+        # Telemetry should have been published (first call always passes gating)
+        telemetry_topics = [
+            t for t, _, _, _ in ctx.mqtt.published if "telemetry/odom" in t
+        ]
+        assert len(telemetry_topics) >= 1
+
+        comp.stop()
