@@ -16,29 +16,7 @@ import pytest
 from lucid_component_base import ComponentContext, ComponentStatus
 
 from lucid_component_ros_bridge import RosBridgeComponent
-
-
-def _fake_context(config: dict | None = None) -> ComponentContext:
-    class FakeMqtt:
-        def __init__(self) -> None:
-            self.published: list[tuple] = []
-
-        def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False) -> None:
-            self.published.append((topic, payload, qos, retain))
-
-    return ComponentContext.create(
-        agent_id="test-agent",
-        base_topic="lucid/agents/test-agent",
-        component_id="ros_bridge",
-        mqtt=FakeMqtt(),
-        config=config or {},
-    )
-
-
-def _write_yaml(tmp_path: Path, content: str) -> Path:
-    p = tmp_path / "ros_bridge.yaml"
-    p.write_text(textwrap.dedent(content), encoding="utf-8")
-    return p
+from tests.conftest import make_context as _fake_context, write_yaml as _write_yaml
 
 
 # -- instantiation --------------------------------------------------------

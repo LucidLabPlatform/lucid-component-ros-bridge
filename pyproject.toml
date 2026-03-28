@@ -17,13 +17,17 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
-rich = ["rospy_message_converter"]
+message-converter = ["rospy_message_converter"]
 
 [project.entry-points."lucid_components"]
 ros_bridge = "lucid_component_ros_bridge.component:RosBridgeComponent"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
 
 [tool.setuptools.packages.find]
 where = ["src"]

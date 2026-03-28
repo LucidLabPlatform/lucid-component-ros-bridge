@@ -42,36 +42,7 @@ from lucid_component_ros_bridge.component import (
     _topic_to_metric,
     _utc_iso,
 )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-class FakeMqtt:
-    def __init__(self) -> None:
-        self.published: list[tuple] = []
-
-    def publish(self, topic: str, payload, *, qos: int = 0, retain: bool = False) -> None:
-        self.published.append((topic, payload, qos, retain))
-
-
-def _fake_context(config: dict | None = None) -> ComponentContext:
-    mqtt = FakeMqtt()
-    ctx = ComponentContext.create(
-        agent_id="test-agent",
-        base_topic="lucid/agents/test-agent",
-        component_id="ros_bridge",
-        mqtt=mqtt,
-        config=config or {},
-    )
-    return ctx
-
-
-def _write_yaml(tmp_path: Path, content: str) -> Path:
-    p = tmp_path / "ros_bridge.yaml"
-    p.write_text(textwrap.dedent(content), encoding="utf-8")
-    return p
+from tests.conftest import FakeMqtt, make_context as _fake_context, write_yaml as _write_yaml
 
 
 def _comp_with_publishers(tmp_path: Path) -> RosBridgeComponent:
@@ -303,6 +274,274 @@ def test_discover_ros_topics_master_query_fails():
     assert pubs == []
 
 
+def test_max_telemetry_payload_bytes_none_by_default():
+    comp = RosBridgeComponent(_fake_context())
+    assert comp._max_telemetry_payload_bytes is None
+
+
+def test_max_telemetry_payload_bytes_from_yaml(tmp_path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        max_telemetry_payload_bytes: 65536
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    assert comp._max_telemetry_payload_bytes == 65536
+
+
+def test_subscription_callback_skips_oversized_payload(tmp_path, monkeypatch):
+    """Payload exceeding max_telemetry_payload_bytes is not published."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        max_telemetry_payload_bytes: 10
+        ros_subscriptions:
+          - ros_topic: /odom
+            msg_type: nav_msgs/Odometry
+            telemetry_metric: odom
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
+    captured_callbacks = []
+
+    def fake_subscriber(topic, msg_type, callback):
+        captured_callbacks.append(callback)
+        return MagicMock()
+
+    fake_rospy.Subscriber.side_effect = fake_subscriber
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        comp.start()
+
+        class BigMsg:
+            __slots__ = ["data"]
+            def __init__(self):
+                self.data = "x" * 100  # well over 10 bytes
+
+        with patch.dict("sys.modules", {"rospy_message_converter": None}):
+            captured_callbacks[0](BigMsg())
+
+        # latest_values is still updated
+        assert "odom" in comp._latest_values
+        # but telemetry was NOT published
+        telemetry_topics = [t for t, _, _, _ in ctx.mqtt.published if "telemetry/odom" in t]
+        assert len(telemetry_topics) == 0
+        comp.stop()
+
+
+def test_subscription_callback_publishes_within_limit(tmp_path, monkeypatch):
+    """Payload within max_telemetry_payload_bytes is published normally."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        max_telemetry_payload_bytes: 1000000
+        ros_subscriptions:
+          - ros_topic: /odom
+            msg_type: nav_msgs/Odometry
+            telemetry_metric: odom
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
+    captured_callbacks = []
+
+    def fake_subscriber(topic, msg_type, callback):
+        captured_callbacks.append(callback)
+        return MagicMock()
+
+    fake_rospy.Subscriber.side_effect = fake_subscriber
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        comp.start()
+
+        class SmallMsg:
+            __slots__ = ["x"]
+            def __init__(self):
+                self.x = 1.0
+
+        with patch.dict("sys.modules", {"rospy_message_converter": None}):
+            captured_callbacks[0](SmallMsg())
+
+        telemetry_topics = [t for t, _, _, _ in ctx.mqtt.published if "telemetry/odom" in t]
+        assert len(telemetry_topics) >= 1
+        comp.stop()
+
+
+def test_cfg_payload_includes_max_telemetry_payload_bytes(tmp_path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        max_telemetry_payload_bytes: 524288
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    assert comp.get_cfg_payload()["max_telemetry_payload_bytes"] == 524288
+
+
+def test_max_auto_discover_publishers_default(tmp_path):
+    """Default cap is 50."""
+    comp = RosBridgeComponent(_fake_context())
+    assert comp._max_auto_discover_publishers == 50
+
+
+def test_max_auto_discover_publishers_from_yaml(tmp_path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        auto_discover: true
+        max_auto_discover_publishers: 10
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    assert comp._max_auto_discover_publishers == 10
+
+
+def test_max_auto_discover_publishers_exceeded_raises(tmp_path, monkeypatch):
+    """start() raises RuntimeError when discovered publishers exceed the cap."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        auto_discover: true
+        max_auto_discover_publishers: 2
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_rospy.get_published_topics.return_value = [
+        ("/a", "std_msgs/String"),
+        ("/b", "std_msgs/String"),
+        ("/c", "std_msgs/String"),  # 3 topics > cap of 2
+    ]
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        with pytest.raises(RuntimeError, match="max_auto_discover_publishers"):
+            comp.start()
+
+    assert comp.state.status == ComponentStatus.FAILED
+
+
+def test_max_auto_discover_publishers_within_limit_starts_ok(tmp_path, monkeypatch):
+    """start() succeeds when discovered publishers are within the cap."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: bot
+        auto_discover: true
+        max_auto_discover_publishers: 5
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    fake_rospy = _make_fake_rospy()
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
+    fake_rospy.get_published_topics.return_value = [("/odom", "nav_msgs/Odometry")]
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        comp.start()
+        assert comp.state.status == ComponentStatus.RUNNING
+        comp.stop()
+
+
+# ---------------------------------------------------------------------------
+# cfg/set expanded keys
+# ---------------------------------------------------------------------------
+
+def test_cmd_cfg_set_auto_discover():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-ad", "set": {"auto_discover": False}}))
+    assert comp._auto_discover is False
+    result = [json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t]
+    assert result[0]["ok"] is True
+    assert result[0]["applied"]["auto_discover"] is False
+
+
+def test_cmd_cfg_set_max_auto_discover_publishers():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-m", "set": {"max_auto_discover_publishers": 10}}))
+    assert comp._max_auto_discover_publishers == 10
+
+
+def test_cmd_cfg_set_max_telemetry_payload_bytes():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-tp", "set": {"max_telemetry_payload_bytes": 262144}}))
+    assert comp._max_telemetry_payload_bytes == 262144
+
+
+def test_cmd_cfg_set_max_telemetry_payload_bytes_null():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-null", "set": {"max_telemetry_payload_bytes": None}}))
+    assert comp._max_telemetry_payload_bytes is None
+
+
+def test_cmd_cfg_set_exclude_topics():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-et", "set": {"exclude_topics": ["/rosout", "/clock"]}}))
+    assert "/rosout" in comp._exclude_topics
+    assert "/clock" in comp._exclude_topics
+    result = [json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t]
+    assert result[0]["ok"] is True
+
+
+def test_cmd_cfg_set_exclude_topics_invalid_type():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-bad", "set": {"exclude_topics": "not_a_list"}}))
+    result = [json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t]
+    assert result[0]["ok"] is True
+    rejected = json.loads(result[0]["error"])["rejected"]
+    assert "exclude_topics" in rejected
+
+
+def test_cmd_cfg_set_ros_subscriptions_rejected():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-rs", "set": {"ros_subscriptions": []}}))
+    result = [json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t]
+    assert result[0]["ok"] is True
+    rejected = json.loads(result[0]["error"])["rejected"]
+    assert "ros_subscriptions" in rejected
+
+
+def test_cmd_cfg_set_unknown_key_rejected():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_cfg_set(json.dumps({"request_id": "r-uk", "set": {"totally_unknown": 99}}))
+    result = [json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/cfg/set/result" in t]
+    assert result[0]["ok"] is True
+    rejected = json.loads(result[0]["error"])["rejected"]
+    assert "totally_unknown" in rejected
+
+
 # ---------------------------------------------------------------------------
 # handle_ros_publish
 # ---------------------------------------------------------------------------
@@ -452,7 +691,7 @@ def test_cmd_reset_malformed_json():
 
 
 def test_cmd_cfg_set_no_recognised_keys():
-    """cfg/set with no recognised key → applied is None, ok=True."""
+    """cfg/set with no recognised key → ok=True, unknown key appears in rejected."""
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
     comp.on_cmd_cfg_set(json.dumps({"request_id": "r5", "set": {"unknown_key": 42}}))
@@ -461,6 +700,8 @@ def test_cmd_cfg_set_no_recognised_keys():
     ]
     assert len(result_msgs) == 1
     assert result_msgs[0]["ok"] is True
+    rejected = json.loads(result_msgs[0]["error"])["rejected"]
+    assert "unknown_key" in rejected
 
 
 def test_cmd_cfg_set_empty_payload():
@@ -544,8 +785,11 @@ def _make_fake_rospy():
     return fake_rospy
 
 
-def test_start_runs_with_mocked_rospy(tmp_path: Path):
+def test_start_runs_with_mocked_rospy(tmp_path: Path, monkeypatch):
     """Component starts successfully when rospy is mocked."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false
@@ -564,8 +808,11 @@ def test_start_runs_with_mocked_rospy(tmp_path: Path):
         comp.stop()
 
 
-def test_stop_after_start_with_mocked_rospy(tmp_path: Path):
+def test_stop_after_start_with_mocked_rospy(tmp_path: Path, monkeypatch):
     """Component transitions to STOPPED after stop() when rospy is mocked."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false
@@ -586,6 +833,32 @@ def test_stop_after_start_with_mocked_rospy(tmp_path: Path):
     assert comp.state.status == ComponentStatus.STOPPED
 
 
+def test_restart_skips_init_node(tmp_path: Path, monkeypatch):
+    """Second start() does not call rospy.init_node() again."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    fake_rospy = _make_fake_rospy()
+    fake_rospy.is_shutdown.return_value = True
+
+    comp1 = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    comp2 = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+
+    with patch.dict("sys.modules", {"rospy": fake_rospy}):
+        comp1.start()
+        comp1.stop()
+        comp2.start()
+        comp2.stop()
+
+    assert fake_rospy.init_node.call_count == 1
+
+
 def test_stop_idempotent_when_already_stopped():
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
@@ -594,8 +867,11 @@ def test_stop_idempotent_when_already_stopped():
     assert comp.state.status == ComponentStatus.STOPPED
 
 
-def test_start_with_auto_discover_and_mocked_rospy(tmp_path: Path):
+def test_start_with_auto_discover_and_mocked_rospy(tmp_path: Path, monkeypatch):
     """auto_discover path is exercised: _discover_ros_topics is called."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: true
@@ -623,8 +899,11 @@ def test_start_with_auto_discover_and_mocked_rospy(tmp_path: Path):
         comp.stop()
 
 
-def test_start_with_ros_subscription_msg_type_resolution_failure(tmp_path: Path):
+def test_start_with_ros_subscription_msg_type_resolution_failure(tmp_path: Path, monkeypatch):
     """If msg_type resolution fails for a subscription, it is skipped (component still starts)."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false
@@ -647,8 +926,11 @@ def test_start_with_ros_subscription_msg_type_resolution_failure(tmp_path: Path)
         comp.stop()
 
 
-def test_start_with_ros_publisher_msg_type_resolution_failure(tmp_path: Path):
+def test_start_with_ros_publisher_msg_type_resolution_failure(tmp_path: Path, monkeypatch):
     """If msg_type resolution fails for a publisher, it is skipped (component still starts)."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false
@@ -730,8 +1012,11 @@ def test_spin_loop_exits_on_ros_interrupt():
 # Telemetry callback wiring (via ROS subscriber callback)
 # ---------------------------------------------------------------------------
 
-def test_ros_subscription_callback_publishes_telemetry(tmp_path: Path):
+def test_ros_subscription_callback_publishes_telemetry(tmp_path: Path, monkeypatch):
     """When a ROS message is received, the callback publishes telemetry."""
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false

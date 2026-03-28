@@ -14,6 +14,18 @@ node_name: lucid_ros_bridge
 # Explicit ros_subscriptions/ros_publishers below are merged in and take
 # priority over discovered entries for the same topic.
 auto_discover: true
+# Maximum number of publishers auto_discover is allowed to register.
+# If the ROS master returns more topics than this limit, the component
+# fails at startup with an error. Raise the limit or add noisy topics
+# to exclude_topics. Default: 50.
+max_auto_discover_publishers: 50
+
+# Maximum telemetry payload size in bytes. If a serialised ROS message exceeds
+# this limit the publish is skipped and a warning is logged. Prevents EMQX's
+# default 1 MB broker limit from being violated by binary topics (e.g.
+# sensor_msgs/Image, sensor_msgs/PointCloud2).
+# Set to null (default) for no limit.
+max_telemetry_payload_bytes: null
 
 # Topics to skip during auto-discovery. Only used when auto_discover is true.
 # Example:

@@ -39,6 +39,10 @@ from lucid_component_base import Component, ComponentContext
 
 logger = logging.getLogger(__name__)
 
+# rospy.init_node() may only be called once per Python process.
+# This flag prevents a second call when the component is restarted.
+_ros_node_initialized: bool = False
+
 # Default config: shipped alongside this module
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "ros_bridge.yaml"
 
@@ -245,6 +249,12 @@ class RosBridgeComponent(Component):
 
         self._node_name: str = self._bridge_cfg.get("node_name", "lucid_ros_bridge")
         self._auto_discover: bool = bool(self._bridge_cfg.get("auto_discover", False))
+        self._max_auto_discover_publishers: int = int(
+            self._bridge_cfg.get("max_auto_discover_publishers", 50)
+        )
+        self._max_telemetry_payload_bytes: int | None = (
+            self._bridge_cfg.get("max_telemetry_payload_bytes") or None
+        )
         self._exclude_topics: set[str] = set(self._bridge_cfg.get("exclude_topics") or [])
         self._ros_subscriptions: list[dict[str, str]] = self._bridge_cfg.get("ros_subscriptions") or []
         self._ros_publishers: list[dict[str, str]] = self._bridge_cfg.get("ros_publishers") or []
@@ -300,6 +310,8 @@ class RosBridgeComponent(Component):
         return {
             "node_name": self._node_name,
             "auto_discover": self._auto_discover,
+            "max_auto_discover_publishers": self._max_auto_discover_publishers,
+            "max_telemetry_payload_bytes": self._max_telemetry_payload_bytes,
             "exclude_topics": sorted(self._exclude_topics),
             "ros_subscriptions": self._ros_subscriptions,
             "ros_publishers": self._ros_publishers,
@@ -319,8 +331,17 @@ class RosBridgeComponent(Component):
         # Initialise the ROS node (anonymous=True avoids name collisions if
         # multiple bridges run on the same machine, disable_signals=True so
         # rospy doesn't hijack SIGINT from the LUCID agent process).
-        rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
-        self._log.info("ROS node '%s' initialised", self._node_name)
+        # rospy.init_node() may only be called once per process — skip on restart.
+        global _ros_node_initialized
+        if not _ros_node_initialized:
+            rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
+            _ros_node_initialized = True
+            self._log.info("ROS node '%s' initialised", self._node_name)
+        else:
+            self._log.info(
+                "ROS node already initialised (process-level singleton); "
+                "skipping rospy.init_node() on restart"
+            )
 
         # Auto-discover topics from ROS master if enabled
         if self._auto_discover:
@@ -329,6 +350,12 @@ class RosBridgeComponent(Component):
             discovered_subs, discovered_pubs = _discover_ros_topics(
                 self._exclude_topics, explicit_sub_topics, explicit_pub_topics,
             )
+            if len(discovered_pubs) > self._max_auto_discover_publishers:
+                raise RuntimeError(
+                    f"auto_discover found {len(discovered_pubs)} publishers, which exceeds "
+                    f"max_auto_discover_publishers={self._max_auto_discover_publishers}. "
+                    "Raise the limit in ros_bridge.yaml or add topics to exclude_topics."
+                )
             self._ros_subscriptions.extend(discovered_subs)
             self._ros_publishers.extend(discovered_pubs)
 
@@ -399,6 +426,15 @@ class RosBridgeComponent(Component):
                     with self._values_lock:
                         self._latest_values[metric_name] = data
                     if self.should_publish_telemetry(metric_name, data):
+                        if self._max_telemetry_payload_bytes is not None:
+                            encoded = json.dumps(data).encode("utf-8")
+                            if len(encoded) > self._max_telemetry_payload_bytes:
+                                self._log.warning(
+                                    "Telemetry payload for metric '%s' is %d bytes, "
+                                    "exceeds max_telemetry_payload_bytes=%d; skipping publish",
+                                    metric_name, len(encoded), self._max_telemetry_payload_bytes,
+                                )
+                                return
                         self.publish_telemetry(metric_name, data)
                 return _callback
 
@@ -497,10 +533,48 @@ class RosBridgeComponent(Component):
             return
 
         applied: dict[str, Any] = {}
+        rejected: dict[str, str] = {}
 
+        # Takes effect immediately
         if "node_name" in set_dict:
             self._node_name = str(set_dict["node_name"])
             applied["node_name"] = self._node_name
+
+        if "auto_discover" in set_dict:
+            self._auto_discover = bool(set_dict["auto_discover"])
+            applied["auto_discover"] = self._auto_discover
+
+        if "max_auto_discover_publishers" in set_dict:
+            self._max_auto_discover_publishers = int(set_dict["max_auto_discover_publishers"])
+            applied["max_auto_discover_publishers"] = self._max_auto_discover_publishers
+
+        if "max_telemetry_payload_bytes" in set_dict:
+            val = set_dict["max_telemetry_payload_bytes"]
+            self._max_telemetry_payload_bytes = int(val) if val is not None else None
+            applied["max_telemetry_payload_bytes"] = self._max_telemetry_payload_bytes
+
+        if "exclude_topics" in set_dict:
+            raw = set_dict["exclude_topics"]
+            if isinstance(raw, list):
+                self._exclude_topics = {str(t) for t in raw}
+                applied["exclude_topics"] = sorted(self._exclude_topics)
+            else:
+                rejected["exclude_topics"] = "must be a list of topic strings"
+
+        # Cannot change at runtime — restart required
+        for key in ("ros_subscriptions", "ros_publishers"):
+            if key in set_dict:
+                rejected[key] = "cannot be changed at runtime; restart required"
+
+        # Unknown keys
+        known_keys = {
+            "node_name", "auto_discover", "max_auto_discover_publishers",
+            "max_telemetry_payload_bytes", "exclude_topics",
+            "ros_subscriptions", "ros_publishers",
+        }
+        for key in set_dict:
+            if key not in known_keys:
+                rejected[key] = "unknown config key"
 
         self.publish_state()
         self.publish_cfg()
@@ -508,7 +582,7 @@ class RosBridgeComponent(Component):
             request_id=request_id,
             ok=True,
             applied=applied if applied else None,
-            error=None,
+            error=json.dumps({"rejected": rejected}) if rejected else None,
             ts=_utc_iso(),
         )
 

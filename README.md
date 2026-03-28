@@ -27,6 +27,8 @@ ROS 1 ↔ LUCID MQTT bridge component. Enables any ROS-enabled device to partici
 
 ```bash
 pip install lucid-component-ros-bridge
+# with richer ROS message serialization:
+# pip install lucid-component-ros-bridge[message-converter]
 # or in development (from the mono-workspace root):
 make setup-venv && source .venv/bin/activate
 ```
