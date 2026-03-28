@@ -1,0 +1,17 @@
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.DS_Store
+.idea/
+.vscode/
+*.swp

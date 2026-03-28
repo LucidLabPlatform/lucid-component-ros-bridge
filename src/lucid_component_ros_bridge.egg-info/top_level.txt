@@ -1,1 +1,0 @@
-lucid_component_ros_bridge

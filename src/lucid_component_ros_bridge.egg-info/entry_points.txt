@@ -1,2 +1,0 @@
-[lucid_components]
-ros_bridge = lucid_component_ros_bridge.component:RosBridgeComponent
