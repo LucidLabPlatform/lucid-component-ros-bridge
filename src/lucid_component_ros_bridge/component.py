@@ -324,8 +324,9 @@ class RosBridgeComponent(Component):
             import rospy
         except ImportError as exc:
             raise RuntimeError(
-                "rospy is not available. Install ROS 1 and source the workspace "
-                "(source /opt/ros/<distro>/setup.bash) before running the ROS bridge component."
+                "rospy is not available. Install ROS 1 and source both "
+                "/opt/ros/noetic/setup.bash and your workspace setup.bash "
+                "before running the ROS bridge component."
             ) from exc
 
         # Initialise the ROS node (anonymous=True avoids name collisions if

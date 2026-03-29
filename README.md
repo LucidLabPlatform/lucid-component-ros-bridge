@@ -19,6 +19,7 @@ ROS 1 ↔ LUCID MQTT bridge component. Enables any ROS-enabled device to partici
 - ROS 1 (e.g. ROS Noetic) installed and workspace sourced:
   ```bash
   source /opt/ros/noetic/setup.bash
+  source /path/to/your/ws/devel/setup.bash
   ```
 - `rospy` must be importable in the Python environment used to run the agent. The component will raise `RuntimeError` at start if `rospy` is absent.
 - (Optional) `rospy_message_converter` for richer message serialization — the component falls back gracefully to `__slots__` iteration if it is not installed.
