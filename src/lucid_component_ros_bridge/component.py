@@ -28,6 +28,10 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
+import shlex
+import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +55,39 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _load_bridge_config_with_source(
+    context_config: dict[str, Any],
+) -> tuple[dict[str, Any], Path | None]:
+    """Load the bridge YAML config and return the selected source path."""
+    # 1. Explicit override
+    explicit = context_config.get("config_path")
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if not p.is_file():
+            raise FileNotFoundError(f"ROS bridge config not found: {p}")
+        logger.info("Loading ROS bridge config from explicit path: %s", p)
+        with p.open("r", encoding="utf-8") as f:
+            return (yaml.safe_load(f) or {}, p)
+
+    # 2. Working-directory override
+    local = Path("ros_bridge.yaml")
+    if local.is_file():
+        p = local.resolve()
+        logger.info("Loading ROS bridge config from working dir: %s", p)
+        with p.open("r", encoding="utf-8") as f:
+            return (yaml.safe_load(f) or {}, p)
+
+    # 3. Default shipped with package
+    if _DEFAULT_CONFIG_PATH.is_file():
+        p = _DEFAULT_CONFIG_PATH.resolve()
+        logger.info("Loading ROS bridge config from package default: %s", p)
+        with p.open("r", encoding="utf-8") as f:
+            return (yaml.safe_load(f) or {}, p)
+
+    logger.warning("No ros_bridge.yaml found — starting with empty config")
+    return ({}, None)
+
+
 def _load_bridge_config(context_config: dict[str, Any]) -> dict[str, Any]:
     """Load the bridge YAML config.
 
@@ -59,31 +96,84 @@ def _load_bridge_config(context_config: dict[str, Any]) -> dict[str, Any]:
       2. ./ros_bridge.yaml             — next to the agent's working directory
       3. <package>/ros_bridge.yaml     — default shipped with the component
     """
-    # 1. Explicit override
-    explicit = context_config.get("config_path")
-    if explicit:
-        p = Path(explicit)
-        if not p.is_file():
-            raise FileNotFoundError(f"ROS bridge config not found: {p}")
-        logger.info("Loading ROS bridge config from explicit path: %s", p)
-        with p.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+    cfg, _ = _load_bridge_config_with_source(context_config)
+    return cfg
 
-    # 2. Working-directory override
-    local = Path("ros_bridge.yaml")
-    if local.is_file():
-        logger.info("Loading ROS bridge config from working dir: %s", local.resolve())
-        with local.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
 
-    # 3. Default shipped with package
-    if _DEFAULT_CONFIG_PATH.is_file():
-        logger.info("Loading ROS bridge config from package default: %s", _DEFAULT_CONFIG_PATH)
-        with _DEFAULT_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+def _resolve_setup_script_paths(
+    setup_scripts: list[Any],
+    *,
+    config_source_path: Path | None,
+) -> list[Path]:
+    """Resolve ordered setup script paths against the active config file."""
+    if not isinstance(setup_scripts, list):
+        raise TypeError("setup_scripts must be a list of script paths")
 
-    logger.warning("No ros_bridge.yaml found — starting with empty config")
-    return {}
+    base_dir = config_source_path.parent if config_source_path is not None else Path.cwd()
+    resolved: list[Path] = []
+    for raw in setup_scripts:
+        if not isinstance(raw, str) or not raw.strip():
+            raise TypeError("setup_scripts entries must be non-empty strings")
+
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = base_dir / path
+        resolved.append(path.resolve())
+
+    return resolved
+
+
+def _sync_sys_path_from_pythonpath(pythonpath: str | None) -> None:
+    """Prepend PYTHONPATH entries to sys.path once, preserving order."""
+    if not pythonpath:
+        return
+
+    entries = [entry for entry in pythonpath.split(os.pathsep) if entry]
+    for entry in reversed(entries):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+
+
+def _source_setup_scripts(paths: list[Path]) -> dict[str, str]:
+    """Source setup scripts in order and merge the resulting env into this process."""
+    if not paths:
+        return {}
+
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"ROS setup script not found: {missing[0]}")
+
+    source_chain = " ".join(f"source {shlex.quote(str(path))};" for path in paths)
+    command = f"set -euo pipefail; {source_chain} env -0"
+
+    try:
+        completed = subprocess.run(
+            ["bash", "-lc", command],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Failed to source ROS setup scripts: {exc}") from exc
+
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        detail = stderr or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Failed to source ROS setup scripts: {detail}")
+
+    env_updates: dict[str, str] = {}
+    for item in completed.stdout.split(b"\x00"):
+        if not item:
+            continue
+        key, sep, value = item.partition(b"=")
+        if not sep:
+            continue
+        env_updates[key.decode("utf-8", errors="replace")] = value.decode(
+            "utf-8", errors="replace"
+        )
+
+    os.environ.update(env_updates)
+    _sync_sys_path_from_pythonpath(env_updates.get("PYTHONPATH"))
+    return env_updates
 
 
 def _topic_to_metric(ros_topic: str) -> str:
@@ -245,7 +335,9 @@ class RosBridgeComponent(Component):
         super().__init__(context)
         self._log = context.logger()
 
-        self._bridge_cfg = _load_bridge_config(dict(context.config))
+        self._bridge_cfg, self._bridge_cfg_path = _load_bridge_config_with_source(
+            dict(context.config)
+        )
 
         self._node_name: str = self._bridge_cfg.get("node_name", "lucid_ros_bridge")
         self._auto_discover: bool = bool(self._bridge_cfg.get("auto_discover", False))
@@ -258,6 +350,11 @@ class RosBridgeComponent(Component):
         self._exclude_topics: set[str] = set(self._bridge_cfg.get("exclude_topics") or [])
         self._ros_subscriptions: list[dict[str, str]] = self._bridge_cfg.get("ros_subscriptions") or []
         self._ros_publishers: list[dict[str, str]] = self._bridge_cfg.get("ros_publishers") or []
+        self._setup_scripts: list[str] = list(self._bridge_cfg.get("setup_scripts") or [])
+        self._setup_script_paths: list[Path] = _resolve_setup_script_paths(
+            self._setup_scripts,
+            config_source_path=self._bridge_cfg_path,
+        )
 
         # ROS runtime state (populated on start)
         self._ros_subs: list[Any] = []
@@ -315,11 +412,15 @@ class RosBridgeComponent(Component):
             "exclude_topics": sorted(self._exclude_topics),
             "ros_subscriptions": self._ros_subscriptions,
             "ros_publishers": self._ros_publishers,
+            "setup_scripts": self._setup_scripts,
         }
 
     # -- lifecycle --------------------------------------------------------
 
     def _start(self) -> None:
+        if self._setup_script_paths:
+            _source_setup_scripts(self._setup_script_paths)
+
         try:
             import rospy
         except ImportError as exc:

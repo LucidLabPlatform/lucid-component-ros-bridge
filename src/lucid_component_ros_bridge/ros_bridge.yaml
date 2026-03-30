@@ -8,6 +8,16 @@
 
 node_name: lucid_ros_bridge
 
+# Optional shell scripts to source before importing rospy.
+# Scripts are sourced in order in a single bash process, then the resulting
+# environment is merged into the running component process. Relative paths are
+# resolved relative to this ros_bridge.yaml file.
+# Example:
+# setup_scripts:
+#   - /opt/ros/noetic/setup.bash
+#   - ./ws/devel/setup.bash
+setup_scripts: []
+
 # ── Auto-discovery ──────────────────────────────────────────────────────
 # When true, the bridge queries the ROS master at startup for all published
 # topics and automatically bridges them (subscribe + publish).

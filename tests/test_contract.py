@@ -110,6 +110,8 @@ def test_get_state_payload_returns_dict():
 def test_get_cfg_payload(tmp_path: Path):
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test_bot
+        setup_scripts:
+          - /opt/ros/noetic/setup.bash
         ros_subscriptions:
           - ros_topic: /scan
             msg_type: sensor_msgs/LaserScan
@@ -120,6 +122,7 @@ def test_get_cfg_payload(tmp_path: Path):
     comp = RosBridgeComponent(ctx)
     cfg_payload = comp.get_cfg_payload()
     assert cfg_payload["node_name"] == "test_bot"
+    assert cfg_payload["setup_scripts"] == ["/opt/ros/noetic/setup.bash"]
     assert len(cfg_payload["ros_subscriptions"]) == 1
 
 

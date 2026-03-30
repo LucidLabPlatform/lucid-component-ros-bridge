@@ -24,6 +24,10 @@ ROS 1 ↔ LUCID MQTT bridge component. Enables any ROS-enabled device to partici
 - `rospy` must be importable in the Python environment used to run the agent. The component will raise `RuntimeError` at start if `rospy` is absent.
 - (Optional) `rospy_message_converter` for richer message serialization — the component falls back gracefully to `__slots__` iteration if it is not installed.
 
+If the agent runs under systemd and does not inherit your interactive ROS shell
+environment, configure `setup_scripts` in `ros_bridge.yaml`. The component will
+source those scripts itself before importing `rospy`.
+
 ## Install
 
 ```bash
@@ -47,6 +51,12 @@ Place a `ros_bridge.yaml` file in the agent's working directory, or set `config_
 
 ```yaml
 node_name: lucid_ros_bridge        # ROS node name (default: lucid_ros_bridge)
+
+# Optional ROS setup scripts sourced before importing rospy.
+# Paths are sourced in order; relative paths resolve from this YAML file.
+setup_scripts:
+  - /opt/ros/noetic/setup.bash
+  - /path/to/your/ws/devel/setup.bash
 
 # Auto-discovery: query ROS master for all published topics at startup.
 # Explicit entries below are merged in (explicit takes priority for same topic).

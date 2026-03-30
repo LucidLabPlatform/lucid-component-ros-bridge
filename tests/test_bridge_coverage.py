@@ -36,7 +36,9 @@ from lucid_component_ros_bridge.component import (
     _dict_to_msg,
     _discover_ros_topics,
     _load_bridge_config,
+    _load_bridge_config_with_source,
     _msg_to_dict,
+    _resolve_setup_script_paths,
     _resolve_msg_type,
     _topic_to_command,
     _topic_to_metric,
@@ -103,6 +105,17 @@ def test_load_bridge_config_working_dir_fallback(tmp_path: Path, monkeypatch):
     assert cfg["node_name"] == "cwd_bot"
 
 
+def test_load_bridge_config_with_source_returns_selected_path(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: sourced_bot
+        setup_scripts:
+          - ./scripts/setup.bash
+    """)
+    cfg, source_path = _load_bridge_config_with_source({"config_path": str(cfg_file)})
+    assert cfg["node_name"] == "sourced_bot"
+    assert source_path == cfg_file.resolve()
+
+
 def test_load_bridge_config_no_file_returns_empty(tmp_path: Path, monkeypatch):
     """When neither override nor working-dir yaml nor package default exists, return {}."""
     monkeypatch.chdir(tmp_path)
@@ -113,6 +126,22 @@ def test_load_bridge_config_no_file_returns_empty(tmp_path: Path, monkeypatch):
     ):
         cfg = _load_bridge_config({})
     assert cfg == {}
+
+
+def test_resolve_setup_script_paths_uses_config_directory(tmp_path: Path):
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    setup_dir = cfg_dir / "scripts"
+    setup_dir.mkdir()
+    setup_script = setup_dir / "setup.bash"
+    setup_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    resolved = _resolve_setup_script_paths(
+        ["./scripts/setup.bash"],
+        config_source_path=(cfg_dir / "ros_bridge.yaml").resolve(),
+    )
+
+    assert resolved == [setup_script.resolve()]
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +837,93 @@ def test_start_runs_with_mocked_rospy(tmp_path: Path, monkeypatch):
         comp.stop()
 
 
+def test_start_sources_setup_scripts_before_import(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    setup_script = scripts_dir / "setup.bash"
+    setup_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    rospy_dir = tmp_path / "fake_ros"
+    rospy_dir.mkdir()
+    (rospy_dir / "rospy.py").write_text(
+        textwrap.dedent(
+            """\
+            shutdown = False
+
+            class ROSInterruptException(Exception):
+                pass
+
+            def init_node(*args, **kwargs):
+                return None
+
+            def is_shutdown():
+                return True
+
+            class _Rate:
+                def __init__(self, hz):
+                    self.hz = hz
+
+                def sleep(self):
+                    return None
+
+            def Rate(hz):
+                return _Rate(hz)
+
+            def Subscriber(*args, **kwargs):
+                return object()
+
+            def Publisher(*args, **kwargs):
+                return object()
+
+            def signal_shutdown(reason):
+                global shutdown
+                shutdown = True
+
+            def get_published_topics():
+                return []
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    cfg_file = _write_yaml(tmp_path, f"""\
+        node_name: test_node
+        auto_discover: false
+        setup_scripts:
+          - ./scripts/setup.bash
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    run_result = MagicMock()
+    run_result.returncode = 0
+    run_result.stdout = f"PYTHONPATH={rospy_dir}\x00".encode()
+    run_result.stderr = b""
+
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    sys.modules.pop("rospy", None)
+    try:
+        with patch("lucid_component_ros_bridge.component.subprocess.run", return_value=run_result):
+            comp.start()
+            assert comp.state.status == ComponentStatus.RUNNING
+            assert os.environ["PYTHONPATH"] == str(rospy_dir)
+            assert str(rospy_dir) in sys.path
+            comp.stop()
+    finally:
+        sys.modules.pop("rospy", None)
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
+        while str(rospy_dir) in sys.path:
+            sys.path.remove(str(rospy_dir))
+
+
 def test_stop_after_start_with_mocked_rospy(tmp_path: Path, monkeypatch):
     """Component transitions to STOPPED after stop() when rospy is mocked."""
     import lucid_component_ros_bridge.component as m
@@ -857,6 +973,128 @@ def test_restart_skips_init_node(tmp_path: Path, monkeypatch):
         comp2.stop()
 
     assert fake_rospy.init_node.call_count == 1
+
+
+def test_repeated_start_does_not_duplicate_pythonpath(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    setup_script = scripts_dir / "setup.bash"
+    setup_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    rospy_dir = tmp_path / "fake_ros"
+    rospy_dir.mkdir()
+    (rospy_dir / "rospy.py").write_text(
+        textwrap.dedent(
+            """\
+            class ROSInterruptException(Exception):
+                pass
+
+            def init_node(*args, **kwargs):
+                return None
+
+            def is_shutdown():
+                return True
+
+            class _Rate:
+                def __init__(self, hz):
+                    self.hz = hz
+
+                def sleep(self):
+                    return None
+
+            def Rate(hz):
+                return _Rate(hz)
+
+            def Subscriber(*args, **kwargs):
+                return object()
+
+            def Publisher(*args, **kwargs):
+                return object()
+
+            def signal_shutdown(reason):
+                return None
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        setup_scripts:
+          - ./scripts/setup.bash
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    run_result = MagicMock(returncode=0, stdout=f"PYTHONPATH={rospy_dir}\x00".encode(), stderr=b"")
+
+    comp1 = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+    comp2 = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    sys.modules.pop("rospy", None)
+    try:
+        with patch("lucid_component_ros_bridge.component.subprocess.run", return_value=run_result):
+            comp1.start()
+            comp1.stop()
+            comp2.start()
+            comp2.stop()
+
+        assert sys.path.count(str(rospy_dir)) == 1
+    finally:
+        sys.modules.pop("rospy", None)
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
+        while str(rospy_dir) in sys.path:
+            sys.path.remove(str(rospy_dir))
+
+
+def test_start_with_missing_setup_script_raises(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        setup_scripts:
+          - ./missing/setup.bash
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+
+    with pytest.raises(RuntimeError, match="ROS setup script not found"):
+        comp.start()
+
+
+def test_start_with_setup_script_shell_failure_raises(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", False)
+
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    setup_script = scripts_dir / "setup.bash"
+    setup_script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        setup_scripts:
+          - ./scripts/setup.bash
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    comp = RosBridgeComponent(_fake_context(config={"config_path": str(cfg_file)}))
+
+    run_result = MagicMock(returncode=1, stdout=b"", stderr=b"boom")
+    with patch("lucid_component_ros_bridge.component.subprocess.run", return_value=run_result):
+        with pytest.raises(RuntimeError, match="Failed to source ROS setup scripts: boom"):
+            comp.start()
 
 
 def test_stop_idempotent_when_already_stopped():
