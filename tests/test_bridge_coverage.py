@@ -908,11 +908,14 @@ def test_start_sources_setup_scripts_before_import(tmp_path: Path, monkeypatch):
     old_pythonpath = os.environ.get("PYTHONPATH")
     sys.modules.pop("rospy", None)
     try:
-        with patch("lucid_component_ros_bridge.component.subprocess.run", return_value=run_result):
+        with patch("lucid_component_ros_bridge.component.subprocess.run", return_value=run_result) as mock_run:
             comp.start()
             assert comp.state.status == ComponentStatus.RUNNING
             assert os.environ["PYTHONPATH"] == str(rospy_dir)
             assert str(rospy_dir) in sys.path
+            source_cmd = mock_run.call_args.args[0][2]
+            assert source_cmd.startswith("set -eo pipefail; ")
+            assert "set -euo pipefail" not in source_cmd
             comp.stop()
     finally:
         sys.modules.pop("rospy", None)

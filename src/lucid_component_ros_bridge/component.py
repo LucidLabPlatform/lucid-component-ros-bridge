@@ -144,7 +144,9 @@ def _source_setup_scripts(paths: list[Path]) -> dict[str, str]:
         raise RuntimeError(f"ROS setup script not found: {missing[0]}")
 
     source_chain = " ".join(f"source {shlex.quote(str(path))};" for path in paths)
-    command = f"set -euo pipefail; {source_chain} env -0"
+    # ROS setup scripts commonly reference unset variables internally and are not
+    # safe under `set -u`, so keep error/pipefail handling without nounset.
+    command = f"set -eo pipefail; {source_chain} env -0"
 
     try:
         completed = subprocess.run(
