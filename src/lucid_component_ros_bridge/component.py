@@ -489,15 +489,26 @@ class RosBridgeComponent(Component):
     def _stop(self) -> None:
         self._stop_event.set()
 
-        try:
-            import rospy
-            rospy.signal_shutdown("LUCID component stopping")
-        except ImportError:
-            pass
-
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=5.0)
             self._spin_thread = None
+
+        # Important: do NOT call rospy.signal_shutdown() here.
+        # rospy.init_node() is process-wide and may only be called once; shutting
+        # down rospy would make a component restart impossible without restarting
+        # the whole agent process. Instead, unregister all pubs/subs so this
+        # component stops all ROS network activity when stopped.
+        for sub in list(self._ros_subs):
+            try:
+                sub.unregister()
+            except Exception:
+                self._log.exception("Failed to unregister ROS subscriber")
+
+        for pub in list(self._ros_pubs.values()):
+            try:
+                pub.unregister()
+            except Exception:
+                self._log.exception("Failed to unregister ROS publisher")
 
         self._ros_subs.clear()
         self._ros_pubs.clear()
