@@ -30,9 +30,11 @@ import json
 import logging
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -370,12 +372,20 @@ class RosBridgeComponent(Component):
         self._latest_values: dict[str, dict[str, Any]] = {}
         self._values_lock = threading.Lock()
 
+        # Subprocess management for roslaunch and rosbag
+        self._roslaunch_proc: subprocess.Popen | None = None
+        self._roslaunch_state: str = "idle"
+        self._rosbag_proc: subprocess.Popen | None = None
+        self._rosbag_state: str = "idle"
+        self._rosbag_path: str | None = None
+        self._rosbag_start_time: float | None = None
+
     @property
     def component_id(self) -> str:
         return "ros_bridge"
 
     def capabilities(self) -> list[str]:
-        caps = ["reset", "ping"]
+        caps = ["reset", "ping", "roslaunch_start", "roslaunch_stop", "rosbag_start", "rosbag_stop"]
         for pub_cfg in self._ros_publishers:
             command = pub_cfg.get("command", "")
             if command:
@@ -402,6 +412,8 @@ class RosBridgeComponent(Component):
                 "node_name": self._node_name,
                 "subscriptions_active": len(self._ros_subs),
                 "publishers_active": len(self._ros_pubs),
+                "roslaunch_state": self._roslaunch_state,
+                "rosbag_state": self._rosbag_state,
                 "latest_values": dict(self._latest_values),
             }
 
@@ -488,6 +500,14 @@ class RosBridgeComponent(Component):
 
     def _stop(self) -> None:
         self._stop_event.set()
+
+        # Stop any running subprocesses
+        self._kill_subprocess(self._roslaunch_proc, "roslaunch", sigint_timeout=15)
+        self._roslaunch_proc = None
+        self._roslaunch_state = "idle"
+        self._kill_subprocess(self._rosbag_proc, "rosbag", sigint_timeout=10)
+        self._rosbag_proc = None
+        self._rosbag_state = "idle"
 
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=5.0)
@@ -700,6 +720,184 @@ class RosBridgeComponent(Component):
             error=json.dumps({"rejected": rejected}) if rejected else None,
             ts=_utc_iso(),
         )
+
+    # -- subprocess helpers -------------------------------------------------
+
+    def _kill_subprocess(
+        self,
+        proc: subprocess.Popen | None,
+        label: str,
+        sigint_timeout: int = 10,
+    ) -> int | None:
+        """Send SIGINT to a process group, fall back to SIGKILL. Returns exit code."""
+        if proc is None or proc.poll() is not None:
+            return proc.returncode if proc else None
+        self._log.info("Stopping %s subprocess (pid %d)", label, proc.pid)
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            proc.wait(timeout=sigint_timeout)
+        except subprocess.TimeoutExpired:
+            self._log.warning("%s did not exit in %ds, sending SIGKILL", label, sigint_timeout)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=5)
+        except ProcessLookupError:
+            pass
+        return proc.returncode
+
+    # -- roslaunch command handlers -----------------------------------------
+
+    def on_cmd_roslaunch_start(self, payload_str: str) -> None:
+        """Start a roslaunch subprocess."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+            data = payload.get("data", payload)
+        except json.JSONDecodeError:
+            request_id, data = "", {}
+
+        package = data.get("package", "")
+        launch_file = data.get("launch_file", "")
+        args = data.get("args", "")
+
+        if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
+            self.publish_result("roslaunch_start", request_id, ok=False, error="Already running")
+            return
+        if not package or not launch_file:
+            self.publish_result(
+                "roslaunch_start", request_id, ok=False, error="package and launch_file required",
+            )
+            return
+
+        cmd = f"roslaunch {package} {launch_file}"
+        if args:
+            cmd += f" {args}"
+
+        self._log.info("Starting roslaunch: %s", cmd)
+        self._roslaunch_state = "launching"
+
+        try:
+            self._roslaunch_proc = subprocess.Popen(
+                shlex.split(cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+        except FileNotFoundError as exc:
+            self._roslaunch_state = "idle"
+            self.publish_result("roslaunch_start", request_id, ok=False, error=str(exc))
+            return
+
+        self._roslaunch_state = "running"
+        self.publish_state()
+        self.publish_result("roslaunch_start", request_id, ok=True, error=None)
+
+        # Monitor thread: updates state if roslaunch exits on its own
+        def _monitor() -> None:
+            if self._roslaunch_proc is not None:
+                self._roslaunch_proc.wait()
+                rc = self._roslaunch_proc.returncode
+                self._roslaunch_proc = None
+                self._roslaunch_state = "exited"
+                self._log.info("roslaunch exited with code %s", rc)
+                self.publish_state()
+
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    def on_cmd_roslaunch_stop(self, payload_str: str) -> None:
+        """Stop the running roslaunch subprocess."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+        except json.JSONDecodeError:
+            request_id = ""
+
+        if self._roslaunch_proc is None or self._roslaunch_proc.poll() is not None:
+            self.publish_result("roslaunch_stop", request_id, ok=False, error="Not running")
+            return
+
+        self._roslaunch_state = "stopping"
+        rc = self._kill_subprocess(self._roslaunch_proc, "roslaunch", sigint_timeout=15)
+        self._roslaunch_proc = None
+        self._roslaunch_state = "idle"
+        self.publish_state()
+        self.publish_result("roslaunch_stop", request_id, ok=True, error=None)
+
+    # -- rosbag command handlers --------------------------------------------
+
+    def on_cmd_rosbag_start(self, payload_str: str) -> None:
+        """Start a rosbag record subprocess."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+            data = payload.get("data", payload)
+        except json.JSONDecodeError:
+            request_id, data = "", {}
+
+        output_dir = data.get("output_dir", "/tmp")
+        topics = data.get("topics", "__all__")
+        prefix = data.get("prefix", "lucid")
+
+        if self._rosbag_proc is not None and self._rosbag_proc.poll() is None:
+            self.publish_result("rosbag_start", request_id, ok=False, error="Already recording")
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        bag_name = f"{prefix}_{timestamp}"
+        self._rosbag_path = os.path.join(output_dir, bag_name)
+        self._rosbag_start_time = time.time()
+
+        cmd = ["rosbag", "record", "-O", self._rosbag_path]
+        if topics == "__all__":
+            cmd.append("-a")
+        elif isinstance(topics, list):
+            cmd.extend(topics)
+        elif isinstance(topics, str):
+            cmd.extend(topics.split())
+
+        self._log.info("Starting rosbag: %s", " ".join(cmd))
+
+        try:
+            self._rosbag_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+        except FileNotFoundError as exc:
+            self._rosbag_state = "idle"
+            self.publish_result("rosbag_start", request_id, ok=False, error=str(exc))
+            return
+
+        self._rosbag_state = "recording"
+        self.publish_state()
+        self.publish_result("rosbag_start", request_id, ok=True, error=None)
+
+    def on_cmd_rosbag_stop(self, payload_str: str) -> None:
+        """Stop the running rosbag record subprocess."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+        except json.JSONDecodeError:
+            request_id = ""
+
+        if self._rosbag_proc is None or self._rosbag_proc.poll() is None:
+            self.publish_result("rosbag_stop", request_id, ok=False, error="Not recording")
+            return
+
+        self._kill_subprocess(self._rosbag_proc, "rosbag", sigint_timeout=10)
+
+        duration_s = round(time.time() - self._rosbag_start_time, 1) if self._rosbag_start_time else 0
+        bag_file = f"{self._rosbag_path}.bag"
+        size_mb = round(os.path.getsize(bag_file) / (1024 * 1024), 1) if os.path.exists(bag_file) else 0
+
+        self._rosbag_proc = None
+        self._rosbag_state = "idle"
+        self.publish_state()
+        self.publish_result("rosbag_stop", request_id, ok=True, error=None)
+        self._log.info("rosbag stopped: %s (%.1fs, %.1fMB)", bag_file, duration_s, size_mb)
+
+    # -- ROS topic publish handler ------------------------------------------
 
     def handle_ros_publish(self, command: str, payload_str: str) -> None:
         """Handle a LUCID command that maps to a ROS topic publish.

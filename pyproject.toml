@@ -13,11 +13,12 @@ authors = [{ name = "LUCID" }]
 dependencies = [
   "lucid-component-base @ git+https://github.com/LucidLabPlatform/lucid-component-base@v2.0.0",
   "pyyaml>=6.0",
+  "rospkg>=1.5",
+  "rospy_message_converter>=0.5",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
-message-converter = ["rospy_message_converter"]
 
 [project.entry-points."lucid_components"]
 ros_bridge = "lucid_component_ros_bridge.component:RosBridgeComponent"
