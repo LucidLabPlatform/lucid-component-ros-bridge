@@ -444,6 +444,23 @@ class RosBridgeComponent(Component):
                 "before running the ROS bridge component."
             ) from exc
 
+        # Check ROS master is reachable before attempting init_node(),
+        # which blocks indefinitely if the master is down.
+        master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(master_uri)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 11311
+            import socket
+            sock = socket.create_connection((host, port), timeout=5)
+            sock.close()
+        except (OSError, socket.timeout) as exc:
+            raise RuntimeError(
+                f"ROS master unreachable at {master_uri} — "
+                "ensure roscore is running and ROS_MASTER_URI is correct."
+            ) from exc
+
         # Initialise the ROS node (anonymous=True avoids name collisions if
         # multiple bridges run on the same machine, disable_signals=True so
         # rospy doesn't hijack SIGINT from the LUCID agent process).
