@@ -25,6 +25,7 @@ msg_type format: "package/MessageType" (e.g. "geometry_msgs/Twist")
 """
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import logging
@@ -360,6 +361,17 @@ class RosBridgeComponent(Component):
             config_source_path=self._bridge_cfg_path,
         )
 
+        # Roslaunch configuration
+        roslaunch_raw = self._bridge_cfg.get("roslaunch") or {}
+        if not isinstance(roslaunch_raw, dict):
+            roslaunch_raw = {}
+        self._roslaunch_package: str = str(roslaunch_raw.get("package", ""))
+        self._roslaunch_launch_file: str = str(roslaunch_raw.get("launch_file", ""))
+        self._roslaunch_auto_start: bool = bool(roslaunch_raw.get("auto_start", False))
+        self._roslaunch_args: dict[str, str] = {
+            str(k): str(v) for k, v in (roslaunch_raw.get("args") or {}).items()
+        }
+
         # ROS runtime state (populated on start)
         self._ros_subs: list[Any] = []
         self._ros_pubs: dict[str, Any] = {}  # command_name → rospy.Publisher
@@ -382,7 +394,7 @@ class RosBridgeComponent(Component):
 
     @property
     def component_id(self) -> str:
-        return "ros_bridge"
+        return self.context.component_id
 
     def capabilities(self) -> list[str]:
         caps = ["reset", "ping", "roslaunch_start", "roslaunch_stop", "rosbag_start", "rosbag_stop"]
@@ -404,6 +416,12 @@ class RosBridgeComponent(Component):
             {"ros_topic": p["ros_topic"], "command": p["command"]}
             for p in self._ros_publishers
         ]
+        if self._roslaunch_package:
+            out["roslaunch"] = {
+                "package": self._roslaunch_package,
+                "launch_file": self._roslaunch_launch_file,
+                "auto_start": self._roslaunch_auto_start,
+            }
         return out
 
     def get_state_payload(self) -> dict[str, Any]:
@@ -413,6 +431,8 @@ class RosBridgeComponent(Component):
                 "subscriptions_active": len(self._ros_subs),
                 "publishers_active": len(self._ros_pubs),
                 "roslaunch_state": self._roslaunch_state,
+                "roslaunch_package": self._roslaunch_package,
+                "roslaunch_launch_file": self._roslaunch_launch_file,
                 "rosbag_state": self._rosbag_state,
                 "latest_values": dict(self._latest_values),
             }
@@ -427,7 +447,72 @@ class RosBridgeComponent(Component):
             "ros_subscriptions": self._ros_subscriptions,
             "ros_publishers": self._ros_publishers,
             "setup_scripts": self._setup_scripts,
+            "roslaunch": {
+                "package": self._roslaunch_package,
+                "launch_file": self._roslaunch_launch_file,
+                "auto_start": self._roslaunch_auto_start,
+                "args": dict(self._roslaunch_args),
+            },
         }
+
+    def schema(self) -> dict[str, Any]:
+        s = copy.deepcopy(super().schema())
+        s["publishes"]["state"]["fields"].update({
+            "node_name": {"type": "string"},
+            "subscriptions_active": {"type": "integer"},
+            "publishers_active": {"type": "integer"},
+            "roslaunch_state": {
+                "type": "string",
+                "enum": ["idle", "launching", "running", "exited", "stopping"],
+            },
+            "rosbag_state": {
+                "type": "string",
+                "enum": ["idle", "recording", "stopping"],
+            },
+            "latest_values": {
+                "type": "object",
+                "description": "Latest ROS message values per subscription",
+            },
+        })
+        s["publishes"]["state"]["fields"].update({
+            "roslaunch_package": {"type": "string"},
+            "roslaunch_launch_file": {"type": "string"},
+        })
+        s["publishes"]["cfg"]["fields"].update({
+            "node_name": {"type": "string"},
+            "auto_discover": {"type": "boolean"},
+            "max_auto_discover_publishers": {"type": "integer"},
+            "max_telemetry_payload_bytes": {"type": "integer"},
+            "exclude_topics": {"type": "array", "items": {"type": "string"}},
+            "roslaunch": {
+                "type": "object",
+                "fields": {
+                    "package": {"type": "string"},
+                    "launch_file": {"type": "string"},
+                    "auto_start": {"type": "boolean"},
+                    "args": {"type": "object"},
+                },
+            },
+        })
+        s["subscribes"].update({
+            "cmd/roslaunch_start": {
+                "fields": {
+                    "package": {"type": "string", "description": "Defaults to config roslaunch.package"},
+                    "launch_file": {"type": "string", "description": "Defaults to config roslaunch.launch_file"},
+                    "args": {"type": ["object", "string"], "description": "Dict of key:=value pairs or legacy string"},
+                },
+            },
+            "cmd/roslaunch_stop": {"fields": {}},
+            "cmd/rosbag_start": {
+                "fields": {
+                    "output_dir": {"type": "string", "default": "/tmp"},
+                    "topics": {"type": "array", "items": {"type": "string"}},
+                    "prefix": {"type": "string", "default": "lucid"},
+                },
+            },
+            "cmd/rosbag_stop": {"fields": {}},
+        })
+        return s
 
     # -- lifecycle --------------------------------------------------------
 
@@ -514,6 +599,22 @@ class RosBridgeComponent(Component):
         self._stop_event.clear()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
+
+        # Auto-launch roslaunch if configured
+        if self._roslaunch_auto_start and self._roslaunch_package and self._roslaunch_launch_file:
+            self._log.info(
+                "Auto-starting roslaunch: %s %s",
+                self._roslaunch_package,
+                self._roslaunch_launch_file,
+            )
+            ok = self._do_roslaunch_start(
+                self._roslaunch_package,
+                self._roslaunch_launch_file,
+                self._roslaunch_args,
+                publish_result=False,
+            )
+            if not ok:
+                self._log.error("Auto-start roslaunch failed")
 
     def _stop(self) -> None:
         self._stop_event.set()
@@ -635,6 +736,7 @@ class RosBridgeComponent(Component):
 
     def _publish_all_retained(self) -> None:
         self.publish_metadata()
+        self.publish_schema()
         self.publish_status()
         self.publish_state()
         self.publish_cfg()
@@ -713,6 +815,24 @@ class RosBridgeComponent(Component):
             else:
                 rejected["exclude_topics"] = "must be a list of topic strings"
 
+        if "roslaunch" in set_dict:
+            rl = set_dict["roslaunch"]
+            if isinstance(rl, dict):
+                if "auto_start" in rl:
+                    self._roslaunch_auto_start = bool(rl["auto_start"])
+                    applied.setdefault("roslaunch", {})["auto_start"] = self._roslaunch_auto_start
+                if "args" in rl:
+                    if isinstance(rl["args"], dict):
+                        self._roslaunch_args = {str(k): str(v) for k, v in rl["args"].items()}
+                        applied.setdefault("roslaunch", {})["args"] = dict(self._roslaunch_args)
+                    else:
+                        rejected["roslaunch.args"] = "must be a dict of key→value pairs"
+                for rl_key in ("package", "launch_file"):
+                    if rl_key in rl:
+                        rejected[f"roslaunch.{rl_key}"] = "cannot be changed at runtime; restart required"
+            else:
+                rejected["roslaunch"] = "must be an object"
+
         # Cannot change at runtime — restart required
         for key in ("ros_subscriptions", "ros_publishers"):
             if key in set_dict:
@@ -722,7 +842,7 @@ class RosBridgeComponent(Component):
         known_keys = {
             "node_name", "auto_discover", "max_auto_discover_publishers",
             "max_telemetry_payload_bytes", "exclude_topics",
-            "ros_subscriptions", "ros_publishers",
+            "ros_subscriptions", "ros_publishers", "roslaunch",
         }
         for key in set_dict:
             if key not in known_keys:
@@ -763,50 +883,53 @@ class RosBridgeComponent(Component):
 
     # -- roslaunch command handlers -----------------------------------------
 
-    def on_cmd_roslaunch_start(self, payload_str: str) -> None:
-        """Start a roslaunch subprocess."""
-        try:
-            payload = json.loads(payload_str) if payload_str else {}
-            request_id = payload.get("request_id", "")
-            data = payload.get("data", payload)
-        except json.JSONDecodeError:
-            request_id, data = "", {}
-
-        package = data.get("package", "")
-        launch_file = data.get("launch_file", "")
-        args = data.get("args", "")
-
+    def _do_roslaunch_start(
+        self,
+        package: str,
+        launch_file: str,
+        args: dict[str, str],
+        *,
+        request_id: str = "",
+        publish_result: bool = True,
+    ) -> bool:
+        """Launch a roslaunch subprocess. Returns True on success."""
         if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
-            self.publish_result("roslaunch_start", request_id, ok=False, error="Already running")
-            return
+            if publish_result:
+                self.publish_result("roslaunch_start", request_id, ok=False, error="Already running")
+            return False
+
         if not package or not launch_file:
-            self.publish_result(
-                "roslaunch_start", request_id, ok=False, error="package and launch_file required",
-            )
-            return
+            if publish_result:
+                self.publish_result(
+                    "roslaunch_start", request_id, ok=False,
+                    error="package and launch_file required",
+                )
+            return False
 
-        cmd = f"roslaunch {package} {launch_file}"
-        if args:
-            cmd += f" {args}"
+        cmd_parts = ["roslaunch", package, launch_file]
+        for key, value in args.items():
+            cmd_parts.append(f"{key}:={value}")
 
-        self._log.info("Starting roslaunch: %s", cmd)
+        self._log.info("Starting roslaunch: %s", " ".join(cmd_parts))
         self._roslaunch_state = "launching"
 
         try:
             self._roslaunch_proc = subprocess.Popen(
-                shlex.split(cmd),
+                cmd_parts,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
             )
         except FileNotFoundError as exc:
             self._roslaunch_state = "idle"
-            self.publish_result("roslaunch_start", request_id, ok=False, error=str(exc))
-            return
+            if publish_result:
+                self.publish_result("roslaunch_start", request_id, ok=False, error=str(exc))
+            return False
 
         self._roslaunch_state = "running"
         self.publish_state()
-        self.publish_result("roslaunch_start", request_id, ok=True, error=None)
+        if publish_result:
+            self.publish_result("roslaunch_start", request_id, ok=True, error=None)
 
         # Monitor thread: updates state if roslaunch exits on its own
         def _monitor() -> None:
@@ -819,6 +942,33 @@ class RosBridgeComponent(Component):
                 self.publish_state()
 
         threading.Thread(target=_monitor, daemon=True).start()
+        return True
+
+    def on_cmd_roslaunch_start(self, payload_str: str) -> None:
+        """Start a roslaunch subprocess. Uses YAML config as defaults; payload overrides."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+            data = payload.get("data", payload)
+        except json.JSONDecodeError:
+            request_id, data = "", {}
+
+        package = data.get("package", "") or self._roslaunch_package
+        launch_file = data.get("launch_file", "") or self._roslaunch_launch_file
+
+        # Merge args: config defaults + payload overrides
+        args = dict(self._roslaunch_args)
+        payload_args = data.get("args", "")
+        if isinstance(payload_args, dict):
+            args.update({str(k): str(v) for k, v in payload_args.items()})
+        elif isinstance(payload_args, str) and payload_args.strip():
+            # Backward compat: parse "key:=value" pairs from string
+            for token in shlex.split(payload_args):
+                if ":=" in token:
+                    k, _, v = token.partition(":=")
+                    args[k] = v
+
+        self._do_roslaunch_start(package, launch_file, args, request_id=request_id)
 
     def on_cmd_roslaunch_stop(self, payload_str: str) -> None:
         """Stop the running roslaunch subprocess."""

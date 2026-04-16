@@ -18,6 +18,30 @@ node_name: lucid_ros_bridge
 #   - ./ws/devel/setup.bash
 setup_scripts: []
 
+# ── Roslaunch management ────────────────────────────────────────────────
+# Optional: configure a roslaunch file to be managed by this component.
+# When auto_start is true, the component launches it automatically on startup.
+# All fields appear in the MQTT cfg topic and args can be updated via cfg/set.
+# The cmd/roslaunch_start command uses these as defaults (payload overrides).
+#
+# NOTE: auto_start + auto_discover may conflict — topics created by the
+# launch file won't be available yet when auto_discover queries the master.
+# Use explicit ros_subscriptions with auto_start instead.
+#
+# Example:
+# roslaunch:
+#   package: my_robot_bringup
+#   launch_file: bringup.launch
+#   auto_start: true
+#   args:
+#     robot_ip: "10.0.0.1"
+#     camera_enabled: "true"
+roslaunch:
+  package: ""
+  launch_file: ""
+  auto_start: false
+  args: {}
+
 # ── Auto-discovery ──────────────────────────────────────────────────────
 # When true, the bridge queries the ROS master at startup for all published
 # topics and automatically bridges them (subscribe + publish).

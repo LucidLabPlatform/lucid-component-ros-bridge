@@ -374,3 +374,335 @@ def test_getattr_unknown_attribute_raises():
     comp = RosBridgeComponent(ctx)
     with pytest.raises(AttributeError):
         comp.nonexistent_method()
+
+
+# -- dynamic component_id ------------------------------------------------
+
+def test_component_id_from_context():
+    """component_id follows the registry key via context, not hardcoded."""
+    ctx = _fake_context(component_id="optitrack")
+    comp = RosBridgeComponent(ctx)
+    assert comp.component_id == "optitrack"
+
+
+def test_component_id_default():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    assert comp.component_id == "ros_bridge"
+
+
+# -- roslaunch config -----------------------------------------------------
+
+def test_roslaunch_config_parsed_from_yaml(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: natnet_ros_cpp
+          launch_file: natnet_ros.launch
+          auto_start: true
+          args:
+            serverIP: "10.205.3.3"
+            clientIP: "10.205.10.254"
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+    assert comp._roslaunch_package == "natnet_ros_cpp"
+    assert comp._roslaunch_launch_file == "natnet_ros.launch"
+    assert comp._roslaunch_auto_start is True
+    assert comp._roslaunch_args == {"serverIP": "10.205.3.3", "clientIP": "10.205.10.254"}
+
+
+def test_roslaunch_config_defaults_when_absent():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    assert comp._roslaunch_package == ""
+    assert comp._roslaunch_launch_file == ""
+    assert comp._roslaunch_auto_start is False
+    assert comp._roslaunch_args == {}
+
+
+def test_cfg_payload_includes_roslaunch(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: remote_lab
+          launch_file: start_camera.launch
+          auto_start: false
+          args:
+            ip: "10.205.3.35"
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+    cfg = comp.get_cfg_payload()
+    assert cfg["roslaunch"]["package"] == "remote_lab"
+    assert cfg["roslaunch"]["launch_file"] == "start_camera.launch"
+    assert cfg["roslaunch"]["auto_start"] is False
+    assert cfg["roslaunch"]["args"] == {"ip": "10.205.3.35"}
+
+
+def test_state_payload_includes_roslaunch_info(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: natnet_ros_cpp
+          launch_file: natnet_ros.launch
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+    state = comp.get_state_payload()
+    assert state["roslaunch_package"] == "natnet_ros_cpp"
+    assert state["roslaunch_launch_file"] == "natnet_ros.launch"
+
+
+def test_cfg_set_roslaunch_args():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    payload = json.dumps({
+        "request_id": "r1",
+        "set": {
+            "roslaunch": {
+                "args": {"serverIP": "10.0.0.1", "clientIP": "10.0.0.2"},
+                "auto_start": True,
+            }
+        }
+    })
+    comp.on_cmd_cfg_set(payload)
+    assert comp._roslaunch_args == {"serverIP": "10.0.0.1", "clientIP": "10.0.0.2"}
+    assert comp._roslaunch_auto_start is True
+
+
+def test_cfg_set_roslaunch_rejects_package_change():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    payload = json.dumps({
+        "request_id": "r1",
+        "set": {"roslaunch": {"package": "new_pkg"}}
+    })
+    comp.on_cmd_cfg_set(payload)
+    # package stays empty (default)
+    assert comp._roslaunch_package == ""
+    # Check the result was published with rejection info
+    mqtt = ctx.mqtt
+    result_msgs = [
+        (t, p) for t, p, _, _ in mqtt.published
+        if "evt/cfg/set/result" in t
+    ]
+    assert len(result_msgs) == 1
+    _, result_payload = result_msgs[0]
+    result = json.loads(result_payload)
+    assert result["error"] is not None
+    assert "roslaunch.package" in result["error"]
+
+
+def test_metadata_includes_roslaunch_when_configured(tmp_path: Path):
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: natnet_ros_cpp
+          launch_file: natnet_ros.launch
+          auto_start: true
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+    meta = comp.metadata()
+    assert "roslaunch" in meta
+    assert meta["roslaunch"]["package"] == "natnet_ros_cpp"
+    assert meta["roslaunch"]["auto_start"] is True
+
+
+def test_metadata_omits_roslaunch_when_not_configured():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    meta = comp.metadata()
+    assert "roslaunch" not in meta
+
+
+# -- schema ----------------------------------------------------------------
+
+def test_schema_includes_roslaunch_fields():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    s = comp.schema()
+    # state fields
+    assert "roslaunch_state" in s["publishes"]["state"]["fields"]
+    assert "roslaunch_package" in s["publishes"]["state"]["fields"]
+    assert "roslaunch_launch_file" in s["publishes"]["state"]["fields"]
+    assert "rosbag_state" in s["publishes"]["state"]["fields"]
+    # cfg fields
+    assert "roslaunch" in s["publishes"]["cfg"]["fields"]
+    assert s["publishes"]["cfg"]["fields"]["roslaunch"]["type"] == "object"
+    # subscribes
+    assert "cmd/roslaunch_start" in s["subscribes"]
+    assert "cmd/roslaunch_stop" in s["subscribes"]
+    assert "cmd/rosbag_start" in s["subscribes"]
+    assert "cmd/rosbag_stop" in s["subscribes"]
+
+
+# -- _do_roslaunch_start guards -------------------------------------------
+
+def test_do_roslaunch_start_rejects_missing_package():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    ok = comp._do_roslaunch_start("", "file.launch", {})
+    assert ok is False
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published
+        if "evt/roslaunch_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "required" in results[0]["error"]
+
+
+def test_do_roslaunch_start_rejects_missing_launch_file():
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    ok = comp._do_roslaunch_start("pkg", "", {})
+    assert ok is False
+
+
+def test_do_roslaunch_start_no_result_when_publish_false():
+    """publish_result=False suppresses MQTT result messages (used by auto-start)."""
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    ok = comp._do_roslaunch_start("", "file.launch", {}, publish_result=False)
+    assert ok is False
+    results = [
+        (t, p) for t, p, _, _ in ctx.mqtt.published
+        if "evt/roslaunch_start/result" in t
+    ]
+    assert len(results) == 0
+
+
+# -- on_cmd_roslaunch_start with config defaults --------------------------
+
+def test_roslaunch_start_uses_yaml_defaults(tmp_path: Path):
+    """cmd/roslaunch_start with empty payload uses YAML package/launch_file/args."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: my_pkg
+          launch_file: my.launch
+          args:
+            robot_ip: "10.0.0.1"
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    # Patch Popen so we don't actually launch anything
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        mock_popen.return_value = mock_proc
+
+        comp.on_cmd_roslaunch_start(json.dumps({"request_id": "r1"}))
+
+        mock_popen.assert_called_once()
+        cmd_parts = mock_popen.call_args[0][0]
+        assert cmd_parts[0] == "roslaunch"
+        assert cmd_parts[1] == "my_pkg"
+        assert cmd_parts[2] == "my.launch"
+        assert "robot_ip:=10.0.0.1" in cmd_parts
+
+
+def test_roslaunch_start_payload_overrides_args(tmp_path: Path):
+    """Payload args merge with (and override) YAML defaults."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: my_pkg
+          launch_file: my.launch
+          args:
+            robot_ip: "10.0.0.1"
+            camera: "true"
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        mock_popen.return_value = mock_proc
+
+        comp.on_cmd_roslaunch_start(json.dumps({
+            "request_id": "r1",
+            "data": {"args": {"robot_ip": "10.0.0.2", "lidar": "true"}},
+        }))
+
+        cmd_parts = mock_popen.call_args[0][0]
+        # robot_ip overridden, camera kept from defaults, lidar added
+        assert "robot_ip:=10.0.0.2" in cmd_parts
+        assert "camera:=true" in cmd_parts
+        assert "lidar:=true" in cmd_parts
+
+
+def test_roslaunch_start_legacy_string_args(tmp_path: Path):
+    """Backward compat: args as 'key:=value' string."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: my_pkg
+          launch_file: my.launch
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.pid = 12345
+        mock_popen.return_value = mock_proc
+
+        comp.on_cmd_roslaunch_start(json.dumps({
+            "request_id": "r1",
+            "data": {"args": "foo:=bar baz:=qux"},
+        }))
+
+        cmd_parts = mock_popen.call_args[0][0]
+        assert "foo:=bar" in cmd_parts
+        assert "baz:=qux" in cmd_parts
+
+
+def test_roslaunch_start_already_running(tmp_path: Path):
+    """Rejects start when a process is already running."""
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test
+        roslaunch:
+          package: my_pkg
+          launch_file: my.launch
+        ros_subscriptions: []
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
+    comp = RosBridgeComponent(ctx)
+
+    # Simulate a running process
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # still running
+    comp._roslaunch_proc = mock_proc
+
+    comp.on_cmd_roslaunch_start(json.dumps({"request_id": "r1"}))
+
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published
+        if "evt/roslaunch_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "Already running" in results[0]["error"]

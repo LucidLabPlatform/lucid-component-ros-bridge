@@ -15,11 +15,11 @@ class FakeMqtt:
         self.published.append((topic, payload, qos, retain))
 
 
-def make_context(config: dict | None = None) -> ComponentContext:
+def make_context(config: dict | None = None, component_id: str = "ros_bridge") -> ComponentContext:
     return ComponentContext.create(
         agent_id="test-agent",
         base_topic="lucid/agents/test-agent",
-        component_id="ros_bridge",
+        component_id=component_id,
         mqtt=FakeMqtt(),
         config=config or {},
     )
