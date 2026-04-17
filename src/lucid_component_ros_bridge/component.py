@@ -367,7 +367,6 @@ class RosBridgeComponent(Component):
             roslaunch_raw = {}
         self._roslaunch_package: str = str(roslaunch_raw.get("package", ""))
         self._roslaunch_launch_file: str = str(roslaunch_raw.get("launch_file", ""))
-        self._roslaunch_auto_start: bool = bool(roslaunch_raw.get("auto_start", False))
         self._roslaunch_args: dict[str, str] = {
             str(k): str(v) for k, v in (roslaunch_raw.get("args") or {}).items()
         }
@@ -420,7 +419,6 @@ class RosBridgeComponent(Component):
             out["roslaunch"] = {
                 "package": self._roslaunch_package,
                 "launch_file": self._roslaunch_launch_file,
-                "auto_start": self._roslaunch_auto_start,
             }
         return out
 
@@ -450,7 +448,6 @@ class RosBridgeComponent(Component):
             "roslaunch": {
                 "package": self._roslaunch_package,
                 "launch_file": self._roslaunch_launch_file,
-                "auto_start": self._roslaunch_auto_start,
                 "args": dict(self._roslaunch_args),
             },
         }
@@ -489,7 +486,6 @@ class RosBridgeComponent(Component):
                 "fields": {
                     "package": {"type": "string"},
                     "launch_file": {"type": "string"},
-                    "auto_start": {"type": "boolean"},
                     "args": {"type": "object"},
                 },
             },
@@ -583,8 +579,8 @@ class RosBridgeComponent(Component):
         # Build telemetry config from subscriptions
         telemetry_cfg = {
             sub["telemetry_metric"]: {
-                "enabled": True,
-                "interval_s": 1,
+                "enabled": False,
+                "interval_s": 0.1,
                 "change_threshold_percent": 0.0,
             }
             for sub in self._ros_subscriptions
@@ -599,22 +595,6 @@ class RosBridgeComponent(Component):
         self._stop_event.clear()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
-
-        # Auto-launch roslaunch if configured
-        if self._roslaunch_auto_start and self._roslaunch_package and self._roslaunch_launch_file:
-            self._log.info(
-                "Auto-starting roslaunch: %s %s",
-                self._roslaunch_package,
-                self._roslaunch_launch_file,
-            )
-            ok = self._do_roslaunch_start(
-                self._roslaunch_package,
-                self._roslaunch_launch_file,
-                self._roslaunch_args,
-                publish_result=False,
-            )
-            if not ok:
-                self._log.error("Auto-start roslaunch failed")
 
     def _stop(self) -> None:
         self._stop_event.set()
@@ -818,9 +798,6 @@ class RosBridgeComponent(Component):
         if "roslaunch" in set_dict:
             rl = set_dict["roslaunch"]
             if isinstance(rl, dict):
-                if "auto_start" in rl:
-                    self._roslaunch_auto_start = bool(rl["auto_start"])
-                    applied.setdefault("roslaunch", {})["auto_start"] = self._roslaunch_auto_start
                 if "args" in rl:
                     if isinstance(rl["args"], dict):
                         self._roslaunch_args = {str(k): str(v) for k, v in rl["args"].items()}

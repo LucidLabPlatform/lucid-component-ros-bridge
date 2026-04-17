@@ -399,7 +399,6 @@ def test_roslaunch_config_parsed_from_yaml(tmp_path: Path):
         roslaunch:
           package: natnet_ros_cpp
           launch_file: natnet_ros.launch
-          auto_start: true
           args:
             serverIP: "10.205.3.3"
             clientIP: "10.205.10.254"
@@ -410,7 +409,6 @@ def test_roslaunch_config_parsed_from_yaml(tmp_path: Path):
     comp = RosBridgeComponent(ctx)
     assert comp._roslaunch_package == "natnet_ros_cpp"
     assert comp._roslaunch_launch_file == "natnet_ros.launch"
-    assert comp._roslaunch_auto_start is True
     assert comp._roslaunch_args == {"serverIP": "10.205.3.3", "clientIP": "10.205.10.254"}
 
 
@@ -419,7 +417,6 @@ def test_roslaunch_config_defaults_when_absent():
     comp = RosBridgeComponent(ctx)
     assert comp._roslaunch_package == ""
     assert comp._roslaunch_launch_file == ""
-    assert comp._roslaunch_auto_start is False
     assert comp._roslaunch_args == {}
 
 
@@ -429,7 +426,6 @@ def test_cfg_payload_includes_roslaunch(tmp_path: Path):
         roslaunch:
           package: remote_lab
           launch_file: start_camera.launch
-          auto_start: false
           args:
             ip: "10.205.3.35"
         ros_subscriptions: []
@@ -440,7 +436,6 @@ def test_cfg_payload_includes_roslaunch(tmp_path: Path):
     cfg = comp.get_cfg_payload()
     assert cfg["roslaunch"]["package"] == "remote_lab"
     assert cfg["roslaunch"]["launch_file"] == "start_camera.launch"
-    assert cfg["roslaunch"]["auto_start"] is False
     assert cfg["roslaunch"]["args"] == {"ip": "10.205.3.35"}
 
 
@@ -468,13 +463,11 @@ def test_cfg_set_roslaunch_args():
         "set": {
             "roslaunch": {
                 "args": {"serverIP": "10.0.0.1", "clientIP": "10.0.0.2"},
-                "auto_start": True,
             }
         }
     })
     comp.on_cmd_cfg_set(payload)
     assert comp._roslaunch_args == {"serverIP": "10.0.0.1", "clientIP": "10.0.0.2"}
-    assert comp._roslaunch_auto_start is True
 
 
 def test_cfg_set_roslaunch_rejects_package_change():
@@ -506,7 +499,6 @@ def test_metadata_includes_roslaunch_when_configured(tmp_path: Path):
         roslaunch:
           package: natnet_ros_cpp
           launch_file: natnet_ros.launch
-          auto_start: true
         ros_subscriptions: []
         ros_publishers: []
     """)
@@ -515,7 +507,6 @@ def test_metadata_includes_roslaunch_when_configured(tmp_path: Path):
     meta = comp.metadata()
     assert "roslaunch" in meta
     assert meta["roslaunch"]["package"] == "natnet_ros_cpp"
-    assert meta["roslaunch"]["auto_start"] is True
 
 
 def test_metadata_omits_roslaunch_when_not_configured():
