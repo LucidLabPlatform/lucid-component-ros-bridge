@@ -371,6 +371,14 @@ class RosBridgeComponent(Component):
             str(k): str(v) for k, v in (roslaunch_raw.get("args") or {}).items()
         }
 
+        # Per-instance ROS env overrides for roslaunch/rosbag subprocesses.
+        # Allows multiple ros_bridge instances to target different ROS masters.
+        # Applied via subprocess.Popen(env=...) — does NOT affect the agent's
+        # rospy connection (which is process-wide, set by systemd/setup_scripts).
+        self._ros_env: dict[str, str] = {
+            str(k): str(v) for k, v in (self._bridge_cfg.get("ros_env") or {}).items()
+        }
+
         # ROS runtime state (populated on start)
         self._ros_subs: list[Any] = []
         self._ros_pubs: dict[str, Any] = {}  # command_name → rospy.Publisher
@@ -445,6 +453,7 @@ class RosBridgeComponent(Component):
             "ros_subscriptions": self._ros_subscriptions,
             "ros_publishers": self._ros_publishers,
             "setup_scripts": self._setup_scripts,
+            "ros_env": dict(self._ros_env),
             "roslaunch": {
                 "package": self._roslaunch_package,
                 "launch_file": self._roslaunch_launch_file,
@@ -890,12 +899,15 @@ class RosBridgeComponent(Component):
         self._log.info("Starting roslaunch: %s", " ".join(cmd_parts))
         self._roslaunch_state = "launching"
 
+        subprocess_env = {**os.environ, **self._ros_env} if self._ros_env else None
+
         try:
             self._roslaunch_proc = subprocess.Popen(
                 cmd_parts,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
+                env=subprocess_env,
             )
         except FileNotFoundError as exc:
             self._roslaunch_state = "idle"
@@ -1001,12 +1013,15 @@ class RosBridgeComponent(Component):
 
         self._log.info("Starting rosbag: %s", " ".join(cmd))
 
+        subprocess_env = {**os.environ, **self._ros_env} if self._ros_env else None
+
         try:
             self._rosbag_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
+                env=subprocess_env,
             )
         except FileNotFoundError as exc:
             self._rosbag_state = "idle"
