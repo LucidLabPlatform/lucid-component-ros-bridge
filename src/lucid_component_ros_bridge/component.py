@@ -605,7 +605,7 @@ class RosBridgeComponent(Component):
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
 
-    def _stop(self) -> None:
+    def _stop(self, *, final: bool = False) -> None:
         self._stop_event.set()
 
         # Stop any running subprocesses
@@ -620,11 +620,9 @@ class RosBridgeComponent(Component):
             self._spin_thread.join(timeout=5.0)
             self._spin_thread = None
 
-        # Important: do NOT call rospy.signal_shutdown() here.
-        # rospy.init_node() is process-wide and may only be called once; shutting
-        # down rospy would make a component restart impossible without restarting
-        # the whole agent process. Instead, unregister all pubs/subs so this
-        # component stops all ROS network activity when stopped.
+        # Unregister all pubs/subs so this component stops all ROS network
+        # activity. During a component-only restart we keep rospy alive
+        # because rospy.init_node() can only be called once per process.
         for sub in list(self._ros_subs):
             try:
                 sub.unregister()
@@ -640,6 +638,17 @@ class RosBridgeComponent(Component):
         self._ros_subs.clear()
         self._ros_pubs.clear()
         self._pub_msg_types.clear()
+
+        if final:
+            # Full agent shutdown — release process-global rospy resources
+            # so the process can exit cleanly instead of hanging in atexit.
+            try:
+                import rospy
+                if rospy.core.is_initialized():
+                    self._log.info("Final shutdown: calling rospy.signal_shutdown()")
+                    rospy.signal_shutdown("agent shutdown")
+            except Exception:
+                self._log.exception("Error during rospy.signal_shutdown()")
 
         self._log.info("ROS bridge stopped")
 
