@@ -531,12 +531,12 @@ def test_schema_includes_roslaunch_fields():
     assert "roslaunch" in s["publishes"]["cfg"]["fields"]
     assert s["publishes"]["cfg"]["fields"]["roslaunch"]["type"] == "object"
     # subscribes
-    assert "cmd/roslaunch_start" in s["subscribes"]
-    assert "cmd/roslaunch_stop" in s["subscribes"]
-    assert "cmd/rosbag_start" in s["subscribes"]
-    assert "cmd/rosbag_stop" in s["subscribes"]
+    assert "cmd/roslaunch-start" in s["subscribes"]
+    assert "cmd/roslaunch-stop" in s["subscribes"]
+    assert "cmd/rosbag-start" in s["subscribes"]
+    assert "cmd/rosbag-stop" in s["subscribes"]
     assert (
-        s["subscribes"]["cmd/rosbag_start"]["fields"]["output_dir"]["default"] == "data"
+        s["subscribes"]["cmd/rosbag-start"]["fields"]["output_dir"]["default"] == "data"
     )
 
 

@@ -404,7 +404,7 @@ class RosBridgeComponent(Component):
         return self.context.component_id
 
     def capabilities(self) -> list[str]:
-        caps = ["reset", "ping", "roslaunch_start", "roslaunch_stop", "rosbag_start", "rosbag_stop"]
+        caps = ["reset", "ping", "roslaunch-start", "roslaunch-stop", "rosbag-start", "rosbag-stop"]
         for pub_cfg in self._ros_publishers:
             command = pub_cfg.get("command", "")
             if command:
@@ -500,22 +500,22 @@ class RosBridgeComponent(Component):
             },
         })
         s["subscribes"].update({
-            "cmd/roslaunch_start": {
+            "cmd/roslaunch-start": {
                 "fields": {
                     "package": {"type": "string", "description": "Defaults to config roslaunch.package"},
                     "launch_file": {"type": "string", "description": "Defaults to config roslaunch.launch_file"},
                     "args": {"type": ["object", "string"], "description": "Dict of key:=value pairs or legacy string"},
                 },
             },
-            "cmd/roslaunch_stop": {"fields": {}},
-            "cmd/rosbag_start": {
+            "cmd/roslaunch-stop": {"fields": {}},
+            "cmd/rosbag-start": {
                 "fields": {
                     "output_dir": {"type": "string", "default": "data"},
                     "topics": {"type": "array", "items": {"type": "string"}},
                     "prefix": {"type": "string", "default": "lucid"},
                 },
             },
-            "cmd/rosbag_stop": {"fields": {}},
+            "cmd/rosbag-stop": {"fields": {}},
         })
         return s
 
