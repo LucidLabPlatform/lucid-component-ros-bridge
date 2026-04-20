@@ -748,8 +748,12 @@ class RosBridgeComponent(Component):
     def on_cmd_reset(self, payload_str: str) -> None:
         """Handle cmd/reset → evt/reset/result.
 
-        If the component is stopped (e.g. roscore was not running at startup),
-        attempts to start it now. Returns ok=True if running after reset.
+        Always performs a full stop-then-start cycle so that ROS subscriptions
+        and publishers are re-registered with the current roscore.  This is
+        required after roscore is restarted, because the previous rospy
+        connections are silently orphaned even though the component status
+        remains RUNNING (the spin thread exits when ROS shuts down but nothing
+        marks the component as stopped).
         """
         try:
             payload = json.loads(payload_str) if payload_str else {}
@@ -760,12 +764,13 @@ class RosBridgeComponent(Component):
         with self._values_lock:
             self._latest_values.clear()
 
-        if self._state.status != ComponentStatus.RUNNING:
-            try:
-                self.start()
-            except Exception as exc:
-                self.publish_result("reset", request_id, ok=False, error=str(exc))
-                return
+        try:
+            if self._state.status == ComponentStatus.RUNNING:
+                self.stop()
+            self.start()
+        except Exception as exc:
+            self.publish_result("reset", request_id, ok=False, error=str(exc))
+            return
 
         self.publish_state()
         self.publish_result("reset", request_id, ok=True, error=None)
