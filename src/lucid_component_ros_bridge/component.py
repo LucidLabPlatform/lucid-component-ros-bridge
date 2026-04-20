@@ -1019,6 +1019,7 @@ class RosBridgeComponent(Component):
 
         raw_out = data.get("output_dir", "data")
         if isinstance(raw_out, str) and not raw_out.strip():
+            self._log.warning("output_dir was blank; defaulting to 'data'")
             raw_out = "data"
         elif not isinstance(raw_out, str):
             self.publish_result(

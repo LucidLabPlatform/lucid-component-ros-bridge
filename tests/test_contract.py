@@ -535,6 +535,125 @@ def test_schema_includes_roslaunch_fields():
     assert "cmd/roslaunch_stop" in s["subscribes"]
     assert "cmd/rosbag_start" in s["subscribes"]
     assert "cmd/rosbag_stop" in s["subscribes"]
+    assert (
+        s["subscribes"]["cmd/rosbag_start"]["fields"]["output_dir"]["default"] == "data"
+    )
+
+
+def test_rosbag_start_rejects_when_default_data_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_rosbag_start(json.dumps({"request_id": "r1"}))
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "existing directory" in (results[0].get("error") or "")
+
+
+def test_rosbag_start_rejects_non_string_output_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_rosbag_start(
+        json.dumps({"request_id": "r_bad", "data": {"output_dir": 123}})
+    )
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "string" in (results[0].get("error") or "")
+
+
+def test_rosbag_start_succeeds_when_data_dir_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    with patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+        comp.on_cmd_rosbag_start(json.dumps({"request_id": "r2"}))
+
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    mock_popen.assert_called_once()
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[0] == "rosbag"
+    assert cmd[1] == "record"
+    assert cmd[2] == "-O"
+    assert cmd[3].startswith(str(tmp_path / "data"))
+
+
+def test_rosbag_start_rejects_when_already_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data").mkdir()
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # still running
+    comp._rosbag_proc = mock_proc
+    comp.on_cmd_rosbag_start(json.dumps({"request_id": "r_dup"}))
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_start/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "Already recording" in (results[0].get("error") or "")
+
+
+def test_rosbag_stop_rejects_when_not_recording() -> None:
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    comp.on_cmd_rosbag_stop(json.dumps({"request_id": "r_stop_no"}))
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_stop/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "Not recording" in (results[0].get("error") or "")
+
+
+def test_rosbag_stop_succeeds_when_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    ctx = _fake_context()
+    comp = RosBridgeComponent(ctx)
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # process running
+    mock_proc.pid = 9999
+    comp._rosbag_proc = mock_proc
+    comp._rosbag_state = "recording"
+    comp._rosbag_path = str(tmp_path / "lucid_2026-01-01-00-00-00")
+    comp._rosbag_start_time = 0.0
+    with patch("os.killpg"), patch("os.getpgid", return_value=9999):
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        comp.on_cmd_rosbag_stop(json.dumps({"request_id": "r_stop_ok"}))
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_stop/result" in t
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert comp._rosbag_state == "idle"
+    assert comp._rosbag_proc is None
 
 
 # -- _do_roslaunch_start guards -------------------------------------------
