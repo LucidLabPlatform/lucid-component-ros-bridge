@@ -42,7 +42,7 @@ from typing import Any
 
 import yaml
 
-from lucid_component_base import Component, ComponentContext
+from lucid_component_base import Component, ComponentContext, ComponentNotReady, ComponentStatus
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +510,7 @@ class RosBridgeComponent(Component):
             "cmd/roslaunch_stop": {"fields": {}},
             "cmd/rosbag_start": {
                 "fields": {
-                    "output_dir": {"type": "string", "default": "/tmp"},
+                    "output_dir": {"type": "string", "default": "data"},
                     "topics": {"type": "array", "items": {"type": "string"}},
                     "prefix": {"type": "string", "default": "lucid"},
                 },
@@ -546,9 +546,13 @@ class RosBridgeComponent(Component):
             sock = socket.create_connection((host, port), timeout=5)
             sock.close()
         except (OSError, socket.timeout) as exc:
-            raise RuntimeError(
+            self._log.error(
+                "ROS master unreachable at %s — component will retry on reset: %s",
+                master_uri, exc,
+            )
+            raise ComponentNotReady(
                 f"ROS master unreachable at {master_uri} — "
-                "ensure roscore is running and ROS_MASTER_URI is correct."
+                "start roscore then send reset to retry."
             ) from exc
 
         # Initialise the ROS node (anonymous=True avoids name collisions if
@@ -742,7 +746,11 @@ class RosBridgeComponent(Component):
     # -- command handlers --------------------------------------------------
 
     def on_cmd_reset(self, payload_str: str) -> None:
-        """Handle cmd/reset → evt/reset/result."""
+        """Handle cmd/reset → evt/reset/result.
+
+        If the component is stopped (e.g. roscore was not running at startup),
+        attempts to start it now. Returns ok=True if running after reset.
+        """
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -751,6 +759,13 @@ class RosBridgeComponent(Component):
 
         with self._values_lock:
             self._latest_values.clear()
+
+        if self._state.status != ComponentStatus.RUNNING:
+            try:
+                self.start()
+            except Exception as exc:
+                self.publish_result("reset", request_id, ok=False, error=str(exc))
+                return
 
         self.publish_state()
         self.publish_result("reset", request_id, ok=True, error=None)
@@ -998,18 +1013,48 @@ class RosBridgeComponent(Component):
         except json.JSONDecodeError:
             request_id, data = "", {}
 
-        output_dir = data.get("output_dir", "/tmp")
-        topics = data.get("topics", "__all__")
-        prefix = data.get("prefix", "lucid")
-
         if self._rosbag_proc is not None and self._rosbag_proc.poll() is None:
             self.publish_result("rosbag_start", request_id, ok=False, error="Already recording")
             return
 
-        os.makedirs(output_dir, exist_ok=True)
+        raw_out = data.get("output_dir", "data")
+        if isinstance(raw_out, str) and not raw_out.strip():
+            raw_out = "data"
+        elif not isinstance(raw_out, str):
+            self.publish_result(
+                "rosbag_start",
+                request_id,
+                ok=False,
+                error="output_dir must be a string",
+            )
+            return
+        else:
+            raw_out = raw_out.strip()
+
+        out_dir = Path(raw_out).expanduser()
+        if not out_dir.is_absolute():
+            out_dir = Path.cwd() / out_dir
+        out_dir = out_dir.resolve()
+
+        if not out_dir.is_dir():
+            self._log.error(
+                "rosbag_start: output_dir '%s' resolved to '%s' which does not exist",
+                raw_out, out_dir,
+            )
+            self.publish_result(
+                "rosbag_start",
+                request_id,
+                ok=False,
+                error=f"output_dir must be an existing directory: {out_dir}",
+            )
+            return
+
+        topics = data.get("topics", "__all__")
+        prefix = data.get("prefix", "lucid")
+
         timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         bag_name = f"{prefix}_{timestamp}"
-        self._rosbag_path = os.path.join(output_dir, bag_name)
+        self._rosbag_path = os.path.join(str(out_dir), bag_name)
         self._rosbag_start_time = time.time()
 
         cmd = ["rosbag", "record", "-O", self._rosbag_path]
@@ -1049,7 +1094,7 @@ class RosBridgeComponent(Component):
         except json.JSONDecodeError:
             request_id = ""
 
-        if self._rosbag_proc is None or self._rosbag_proc.poll() is None:
+        if self._rosbag_proc is None or self._rosbag_proc.poll() is not None:
             self.publish_result("rosbag_stop", request_id, ok=False, error="Not recording")
             return
 
