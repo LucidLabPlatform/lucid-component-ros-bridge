@@ -91,18 +91,6 @@ def _load_bridge_config_with_source(
     return ({}, None)
 
 
-def _load_bridge_config(context_config: dict[str, Any]) -> dict[str, Any]:
-    """Load the bridge YAML config.
-
-    Resolution order:
-      1. context_config["config_path"] — explicit override from agent config
-      2. ./ros_bridge.yaml             — next to the agent's working directory
-      3. <package>/ros_bridge.yaml     — default shipped with the component
-    """
-    cfg, _ = _load_bridge_config_with_source(context_config)
-    return cfg
-
-
 def _resolve_setup_script_paths(
     setup_scripts: list[Any],
     *,
@@ -399,6 +387,9 @@ class RosBridgeComponent(Component):
         self._rosbag_path: str | None = None
         self._rosbag_start_time: float | None = None
 
+        # ROS connection health (set True once subs/pubs are live)
+        self._ros_connected: bool = False
+
     @property
     def component_id(self) -> str:
         return self.context.component_id
@@ -434,6 +425,7 @@ class RosBridgeComponent(Component):
         with self._values_lock:
             return {
                 "node_name": self._node_name,
+                "ros_connected": self._ros_connected,
                 "subscriptions_active": len(self._ros_subs),
                 "publishers_active": len(self._ros_pubs),
                 "roslaunch_state": self._roslaunch_state,
@@ -465,6 +457,7 @@ class RosBridgeComponent(Component):
         s = copy.deepcopy(super().schema())
         s["publishes"]["state"]["fields"].update({
             "node_name": {"type": "string"},
+            "ros_connected": {"type": "boolean"},
             "subscriptions_active": {"type": "integer"},
             "publishers_active": {"type": "integer"},
             "roslaunch_state": {
@@ -588,6 +581,7 @@ class RosBridgeComponent(Component):
 
         self._setup_ros_subscriptions()
         self._setup_ros_publishers()
+        self._ros_connected = True
 
         # Build telemetry config from subscriptions
         telemetry_cfg = {
@@ -610,6 +604,7 @@ class RosBridgeComponent(Component):
         self._spin_thread.start()
 
     def _stop(self, *, final: bool = False) -> None:
+        self._ros_connected = False
         self._stop_event.set()
 
         # Stop any running subprocesses
@@ -723,16 +718,105 @@ class RosBridgeComponent(Component):
                 "ROS publisher %s ← cmd/%s", ros_topic, command,
             )
 
-    def _spin_loop(self) -> None:
-        """Keep the ROS node alive until stop is requested."""
-        import rospy
+    # -- ROS master health & reconnect -------------------------------------
 
-        rate = rospy.Rate(10)  # 10 Hz check loop
-        while not self._stop_event.is_set() and not rospy.is_shutdown():
+    _RECONNECT_INTERVAL_S: float = 5.0
+    _MASTER_HEALTH_INTERVAL_S: float = 5.0
+
+    def _is_ros_master_reachable(self) -> bool:
+        """Quick socket check — does not block for long."""
+        import socket
+        from urllib.parse import urlparse
+        master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+        try:
+            parsed = urlparse(master_uri)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 11311
+            s = socket.create_connection((host, port), timeout=2)
+            s.close()
+            return True
+        except (OSError, socket.timeout):
+            return False
+
+    def _teardown_ros(self) -> None:
+        """Tear down ROS connections only — telemetry config and latest_values are preserved."""
+        if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
+            proc = self._roslaunch_proc
+            self._roslaunch_proc = None
+            self._roslaunch_state = "idle"
+            self._kill_subprocess(proc, "roslaunch", sigint_timeout=5)
+
+        for sub in list(self._ros_subs):
             try:
-                rate.sleep()
-            except rospy.ROSInterruptException:
+                sub.unregister()
+            except Exception:
+                pass
+        self._ros_subs.clear()
+
+        for pub in list(self._ros_pubs.values()):
+            try:
+                pub.unregister()
+            except Exception:
+                pass
+        self._ros_pubs.clear()
+        self._pub_msg_types.clear()
+
+    def _reconnect_ros(self) -> bool:
+        """Re-register ROS subs/pubs without touching telemetry or MQTT state.
+
+        Returns True on success, False if the master is unreachable or setup fails.
+        """
+        if not self._is_ros_master_reachable():
+            return False
+        try:
+            self._setup_ros_subscriptions()
+            self._setup_ros_publishers()
+            self._log.info("ROS reconnected: %d subs, %d pubs", len(self._ros_subs), len(self._ros_pubs))
+            return True
+        except Exception as exc:
+            self._log.error("ROS reconnect failed: %s", exc)
+            for sub in list(self._ros_subs):
+                try:
+                    sub.unregister()
+                except Exception:
+                    pass
+            self._ros_subs.clear()
+            for pub in list(self._ros_pubs.values()):
+                try:
+                    pub.unregister()
+                except Exception:
+                    pass
+            self._ros_pubs.clear()
+            self._pub_msg_types.clear()
+            return False
+
+    def _spin_loop(self) -> None:
+        """Keep ROS alive. Auto-reconnects when master goes offline without resetting telemetry."""
+        while not self._stop_event.is_set():
+            # Reconnect phase
+            if not self._ros_connected:
+                if self._reconnect_ros():
+                    self._ros_connected = True
+                    self.publish_state()
+                    self._log.info("ROS bridge active")
+                else:
+                    self._stop_event.wait(self._RECONNECT_INTERVAL_S)
+                    continue
+
+            # Spin phase: periodic master health checks
+            while not self._stop_event.is_set():
+                if not self._stop_event.wait(timeout=self._MASTER_HEALTH_INTERVAL_S):
+                    # Timeout expired — check master
+                    if not self._is_ros_master_reachable():
+                        break  # master down → teardown and reconnect
+
+            if self._stop_event.is_set():
                 break
+
+            self._log.warning("ROS master unreachable — tearing down connections")
+            self._teardown_ros()
+            self._ros_connected = False
+            self.publish_state()
 
     # -- retained publishing -----------------------------------------------
 
@@ -907,12 +991,7 @@ class RosBridgeComponent(Component):
         request_id: str = "",
         publish_result: bool = True,
     ) -> bool:
-        """Launch a roslaunch subprocess. Returns True on success."""
-        if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
-            if publish_result:
-                self.publish_result("roslaunch_start", request_id, ok=False, error="Already running")
-            return False
-
+        """Launch a roslaunch subprocess. Auto-stops any running launch first. Returns True on success."""
         if not package or not launch_file:
             if publish_result:
                 self.publish_result(
@@ -920,6 +999,18 @@ class RosBridgeComponent(Component):
                     error="package and launch_file required",
                 )
             return False
+
+        # Auto-swap: if a launch is already running, stop it first
+        if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
+            self._log.info(
+                "roslaunch already running (%s), stopping to start %s",
+                self._roslaunch_launch_file, launch_file,
+            )
+            proc = self._roslaunch_proc
+            self._roslaunch_proc = None
+            self._roslaunch_state = "stopping"
+            self.publish_state()
+            self._kill_subprocess(proc, "roslaunch", sigint_timeout=15)
 
         cmd_parts = ["roslaunch", package, launch_file]
         for key, value in args.items():
@@ -986,10 +1077,15 @@ class RosBridgeComponent(Component):
                     k, _, v = token.partition(":=")
                     args[k] = v
 
-        self._do_roslaunch_start(package, launch_file, args, request_id=request_id)
+        threading.Thread(
+            target=self._do_roslaunch_start,
+            args=(package, launch_file, args),
+            kwargs={"request_id": request_id},
+            daemon=True,
+        ).start()
 
     def on_cmd_roslaunch_stop(self, payload_str: str) -> None:
-        """Stop the running roslaunch subprocess."""
+        """Stop the running roslaunch subprocess (async — does not block MQTT thread)."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -1001,11 +1097,17 @@ class RosBridgeComponent(Component):
             return
 
         self._roslaunch_state = "stopping"
-        rc = self._kill_subprocess(self._roslaunch_proc, "roslaunch", sigint_timeout=15)
-        self._roslaunch_proc = None
-        self._roslaunch_state = "idle"
+        proc = self._roslaunch_proc
+        self._roslaunch_proc = None  # prevent double-stop
         self.publish_state()
-        self.publish_result("roslaunch_stop", request_id, ok=True, error=None)
+
+        def _do_stop() -> None:
+            self._kill_subprocess(proc, "roslaunch", sigint_timeout=15)
+            self._roslaunch_state = "idle"
+            self.publish_state()
+            self.publish_result("roslaunch_stop", request_id, ok=True, error=None)
+
+        threading.Thread(target=_do_stop, daemon=True).start()
 
     # -- rosbag command handlers --------------------------------------------
 
