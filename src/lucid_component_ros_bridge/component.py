@@ -496,7 +496,7 @@ class RosBridgeComponent(Component):
             },
         })
         s["subscribes"].update({
-            "cmd/retry": {"fields": {}},
+            "cmd/retry": {"fields": {"force": {"type": "boolean", "description": "If true, force re-registration of subs/pubs even when already connected (use after docker restart). Does not clear latest_values or touch roslaunch."}}},
             "cmd/roslaunch-start": {
                 "fields": {
                     "package": {"type": "string", "description": "Defaults to config roslaunch.package"},
@@ -871,18 +871,43 @@ class RosBridgeComponent(Component):
     def on_cmd_retry(self, payload_str: str) -> None:
         """Handle cmd/retry → trigger a ROS master reconnect attempt.
 
-        Wakes the spin loop to attempt reconnect immediately. No-op if already connected.
+        Wakes the spin loop to attempt reconnect immediately. No-op if already
+        connected, unless ``force`` is true — in that case, subs/pubs are
+        unregistered and re-registered without clearing latest_values or
+        touching the roslaunch. Use after a docker restart where the ROS master
+        is still reachable but registrations are stale.
+
         Result is published immediately; state update follows once the attempt completes.
         """
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
+            force = bool(payload.get("force", False))
         except json.JSONDecodeError:
             request_id = ""
+            force = False
 
-        if self._ros_connected:
+        if self._ros_connected and not force:
             self.publish_result("retry", request_id, ok=True, error="already connected")
             return
+
+        if force and self._ros_connected:
+            # Unregister subs/pubs only — roslaunch and latest_values are preserved
+            for sub in list(self._ros_subs):
+                try:
+                    sub.unregister()
+                except Exception:
+                    pass
+            self._ros_subs.clear()
+            for pub in list(self._ros_pubs.values()):
+                try:
+                    pub.unregister()
+                except Exception:
+                    pass
+            self._ros_pubs.clear()
+            self._pub_msg_types.clear()
+            self._ros_connected = False
+            self.publish_state()
 
         self._retry_event.set()
         self.publish_result("retry", request_id, ok=True, error=None)
