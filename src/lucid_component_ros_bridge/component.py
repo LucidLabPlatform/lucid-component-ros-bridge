@@ -42,7 +42,7 @@ from typing import Any
 
 import yaml
 
-from lucid_component_base import Component, ComponentContext, ComponentNotReady, ComponentStatus
+from lucid_component_base import Component, ComponentContext, ComponentStatus
 
 logger = logging.getLogger(__name__)
 
@@ -390,12 +390,15 @@ class RosBridgeComponent(Component):
         # ROS connection health (set True once subs/pubs are live)
         self._ros_connected: bool = False
 
+        # Set by on_cmd_retry (or at startup) to wake the spin loop's reconnect wait
+        self._retry_event = threading.Event()
+
     @property
     def component_id(self) -> str:
         return self.context.component_id
 
     def capabilities(self) -> list[str]:
-        caps = ["reset", "ping", "roslaunch-start", "roslaunch-stop", "rosbag-start", "rosbag-stop"]
+        caps = ["reset", "ping", "retry", "roslaunch-start", "roslaunch-stop", "rosbag-start", "rosbag-stop"]
         for pub_cfg in self._ros_publishers:
             command = pub_cfg.get("command", "")
             if command:
@@ -493,6 +496,7 @@ class RosBridgeComponent(Component):
             },
         })
         s["subscribes"].update({
+            "cmd/retry": {"fields": {}},
             "cmd/roslaunch-start": {
                 "fields": {
                     "package": {"type": "string", "description": "Defaults to config roslaunch.package"},
@@ -527,31 +531,11 @@ class RosBridgeComponent(Component):
                 "before running the ROS bridge component."
             ) from exc
 
-        # Check ROS master is reachable before attempting init_node(),
-        # which blocks indefinitely if the master is down.
-        master_uri = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(master_uri)
-            host = parsed.hostname or "localhost"
-            port = parsed.port or 11311
-            import socket
-            sock = socket.create_connection((host, port), timeout=5)
-            sock.close()
-        except (OSError, socket.timeout) as exc:
-            self._log.error(
-                "ROS master unreachable at %s — component will retry on reset: %s",
-                master_uri, exc,
-            )
-            raise ComponentNotReady(
-                f"ROS master unreachable at {master_uri} — "
-                "start roscore then send reset to retry."
-            ) from exc
-
         # Initialise the ROS node (anonymous=True avoids name collisions if
         # multiple bridges run on the same machine, disable_signals=True so
         # rospy doesn't hijack SIGINT from the LUCID agent process).
         # rospy.init_node() may only be called once per process — skip on restart.
+        # Does not contact the ROS master — safe to call without roscore running.
         global _ros_node_initialized
         if not _ros_node_initialized:
             rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
@@ -563,27 +547,32 @@ class RosBridgeComponent(Component):
                 "skipping rospy.init_node() on restart"
             )
 
-        # Auto-discover topics from ROS master if enabled
+        # Auto-discover topics if enabled and master is reachable now.
+        # If master is down, discovery is skipped — use reset() once roscore is up
+        # to re-run discovery. retry() only reconnects subs/pubs, no re-discovery.
         if self._auto_discover:
-            explicit_sub_topics = {s["ros_topic"] for s in self._ros_subscriptions}
-            explicit_pub_topics = {p["ros_topic"] for p in self._ros_publishers}
-            discovered_subs, discovered_pubs = _discover_ros_topics(
-                self._exclude_topics, explicit_sub_topics, explicit_pub_topics,
-            )
-            if len(discovered_pubs) > self._max_auto_discover_publishers:
-                raise RuntimeError(
-                    f"auto_discover found {len(discovered_pubs)} publishers, which exceeds "
-                    f"max_auto_discover_publishers={self._max_auto_discover_publishers}. "
-                    "Raise the limit in ros_bridge.yaml or add topics to exclude_topics."
+            if self._is_ros_master_reachable():
+                explicit_sub_topics = {s["ros_topic"] for s in self._ros_subscriptions}
+                explicit_pub_topics = {p["ros_topic"] for p in self._ros_publishers}
+                discovered_subs, discovered_pubs = _discover_ros_topics(
+                    self._exclude_topics, explicit_sub_topics, explicit_pub_topics,
                 )
-            self._ros_subscriptions.extend(discovered_subs)
-            self._ros_publishers.extend(discovered_pubs)
+                if len(discovered_pubs) > self._max_auto_discover_publishers:
+                    raise RuntimeError(
+                        f"auto_discover found {len(discovered_pubs)} publishers, which exceeds "
+                        f"max_auto_discover_publishers={self._max_auto_discover_publishers}. "
+                        "Raise the limit in ros_bridge.yaml or add topics to exclude_topics."
+                    )
+                self._ros_subscriptions.extend(discovered_subs)
+                self._ros_publishers.extend(discovered_pubs)
+            else:
+                self._log.warning(
+                    "auto_discover enabled but ROS master is unreachable — "
+                    "skipping discovery. Send reset once roscore is running."
+                )
 
-        self._setup_ros_subscriptions()
-        self._setup_ros_publishers()
-        self._ros_connected = True
-
-        # Build telemetry config from subscriptions
+        # Build telemetry config from subscriptions (YAML entries only if master was down).
+        # Done here so user-set telemetry config survives a retry without being wiped.
         telemetry_cfg = {
             sub["telemetry_metric"]: {
                 "enabled": False,
@@ -596,16 +585,17 @@ class RosBridgeComponent(Component):
 
         self._publish_all_retained()
 
-        # Keep the ROS node alive in a background thread.
-        # rospy.spin() blocks until rospy.is_shutdown(), so we use a polling
-        # loop that also checks our own stop event.
+        # Start spin loop. _retry_event is set immediately so the loop attempts
+        # to connect on startup without waiting for an explicit retry command.
         self._stop_event.clear()
+        self._retry_event.set()
         self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
         self._spin_thread.start()
 
     def _stop(self, *, final: bool = False) -> None:
         self._ros_connected = False
         self._stop_event.set()
+        self._retry_event.set()  # wake spin loop if it's waiting for a retry
 
         # Stop any running subprocesses
         self._kill_subprocess(self._roslaunch_proc, "roslaunch", sigint_timeout=15)
@@ -720,7 +710,6 @@ class RosBridgeComponent(Component):
 
     # -- ROS master health & reconnect -------------------------------------
 
-    _RECONNECT_INTERVAL_S: float = 5.0
     _MASTER_HEALTH_INTERVAL_S: float = 5.0
 
     def _is_ros_master_reachable(self) -> bool:
@@ -791,24 +780,35 @@ class RosBridgeComponent(Component):
             return False
 
     def _spin_loop(self) -> None:
-        """Keep ROS alive. Auto-reconnects when master goes offline without resetting telemetry."""
+        """Keep ROS alive. Reconnects when master goes offline without resetting telemetry.
+
+        Reconnect is triggered by on_cmd_retry (or automatically at startup).
+        While disconnected the loop blocks until a retry command is received.
+        """
         while not self._stop_event.is_set():
-            # Reconnect phase
+            # Reconnect phase: wait for an explicit retry signal
             if not self._ros_connected:
+                self._retry_event.wait()   # blocks until retry or stop
+                self._retry_event.clear()
+                if self._stop_event.is_set():
+                    break
                 if self._reconnect_ros():
                     self._ros_connected = True
                     self.publish_state()
                     self._log.info("ROS bridge active")
                 else:
-                    self._stop_event.wait(self._RECONNECT_INTERVAL_S)
-                    continue
+                    self._log.warning(
+                        "ROS reconnect failed — send retry to try again"
+                    )
+                    self.publish_state()
+                continue
 
             # Spin phase: periodic master health checks
             while not self._stop_event.is_set():
                 if not self._stop_event.wait(timeout=self._MASTER_HEALTH_INTERVAL_S):
                     # Timeout expired — check master
                     if not self._is_ros_master_reachable():
-                        break  # master down → teardown and reconnect
+                        break  # master down → teardown and wait for retry
 
             if self._stop_event.is_set():
                 break
@@ -867,6 +867,25 @@ class RosBridgeComponent(Component):
         except json.JSONDecodeError:
             request_id = ""
         self.publish_result("ping", request_id, ok=True, error=None)
+
+    def on_cmd_retry(self, payload_str: str) -> None:
+        """Handle cmd/retry → trigger a ROS master reconnect attempt.
+
+        Wakes the spin loop to attempt reconnect immediately. No-op if already connected.
+        Result is published immediately; state update follows once the attempt completes.
+        """
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+        except json.JSONDecodeError:
+            request_id = ""
+
+        if self._ros_connected:
+            self.publish_result("retry", request_id, ok=True, error="already connected")
+            return
+
+        self._retry_event.set()
+        self.publish_result("retry", request_id, ok=True, error=None)
 
     def on_cmd_cfg_set(self, payload_str: str) -> None:
         """Handle cmd/cfg/set → evt/cfg/set/result."""
