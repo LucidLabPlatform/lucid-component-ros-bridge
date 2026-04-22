@@ -343,6 +343,13 @@ class RosBridgeComponent(Component):
         self._exclude_topics: set[str] = set(self._bridge_cfg.get("exclude_topics") or [])
         self._ros_subscriptions: list[dict[str, str]] = self._bridge_cfg.get("ros_subscriptions") or []
         self._ros_publishers: list[dict[str, str]] = self._bridge_cfg.get("ros_publishers") or []
+        # Set of configured publisher command names — built at init time so
+        # __getattr__ can validate commands before _ros_pubs is populated
+        # (the agent subscribes to cmd topics during startup, before the ROS
+        # spin loop connects and fills _ros_pubs).
+        self._ros_publisher_commands: set[str] = {
+            p["command"] for p in self._ros_publishers if p.get("command")
+        }
         self._setup_scripts: list[str] = list(self._bridge_cfg.get("setup_scripts") or [])
         self._setup_script_paths: list[Path] = _resolve_setup_script_paths(
             self._setup_scripts,
@@ -1299,10 +1306,15 @@ class RosBridgeComponent(Component):
             )
 
     def __getattr__(self, name: str) -> Any:
-        """Route on_cmd_<command> calls to handle_ros_publish for configured publishers."""
+        """Route on_cmd_<command> calls to handle_ros_publish for configured publishers.
+
+        Checks against _ros_publisher_commands (built from config at __init__ time) so
+        that the agent can subscribe to these cmd topics at startup — before the ROS
+        spin loop connects and populates _ros_pubs.
+        """
         if name.startswith("on_cmd_"):
             command = name[7:]  # strip "on_cmd_"
-            if command in self._ros_pubs:
+            if command in self._ros_publisher_commands:
                 def _handler(payload_str: str) -> None:
                     self.handle_ros_publish(command, payload_str)
                 return _handler
