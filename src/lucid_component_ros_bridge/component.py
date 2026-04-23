@@ -530,7 +530,7 @@ class RosBridgeComponent(Component):
             _source_setup_scripts(self._setup_script_paths)
 
         try:
-            import rospy
+            import rospy  # noqa: F401 — verify rospy is importable before starting spin thread
         except ImportError as exc:
             raise RuntimeError(
                 "rospy is not available. Install ROS 1 and source both "
@@ -538,27 +538,23 @@ class RosBridgeComponent(Component):
                 "before running the ROS bridge component."
             ) from exc
 
-        # Initialise the ROS node (anonymous=True avoids name collisions if
-        # multiple bridges run on the same machine, disable_signals=True so
-        # rospy doesn't hijack SIGINT from the LUCID agent process).
-        # rospy.init_node() may only be called once per process — skip on restart.
-        # Does not contact the ROS master — safe to call without roscore running.
-        global _ros_node_initialized
-        if not _ros_node_initialized:
-            rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
-            _ros_node_initialized = True
-            self._log.info("ROS node '%s' initialised", self._node_name)
-        else:
-            self._log.info(
-                "ROS node already initialised (process-level singleton); "
-                "skipping rospy.init_node() on restart"
-            )
+        # rospy.init_node() is intentionally deferred to _reconnect_ros() (called from
+        # the background spin thread) so that _start() returns immediately even when
+        # the ROS master is not yet running.  Calling init_node() here blocks until the
+        # master is reachable, which prevents other components from receiving their MQTT
+        # command subscriptions.
 
-        # Auto-discover topics if enabled and master is reachable now.
-        # If master is down, discovery is skipped — use reset() once roscore is up
-        # to re-run discovery. retry() only reconnects subs/pubs, no re-discovery.
+        # Auto-discover topics if enabled and master is already reachable at start time.
+        # If master is down, discovery is skipped — use reset() once roscore is up.
+        # init_node() is called here only when the master is already up (safe, fast path).
         if self._auto_discover:
             if self._is_ros_master_reachable():
+                global _ros_node_initialized
+                if not _ros_node_initialized:
+                    import rospy as _rospy
+                    _rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
+                    _ros_node_initialized = True
+                    self._log.info("ROS node '%s' initialised (auto_discover path)", self._node_name)
                 explicit_sub_topics = {s["ros_topic"] for s in self._ros_subscriptions}
                 explicit_pub_topics = {p["ros_topic"] for p in self._ros_publishers}
                 discovered_subs, discovered_pubs = _discover_ros_topics(
@@ -764,6 +760,17 @@ class RosBridgeComponent(Component):
         """
         if not self._is_ros_master_reachable():
             return False
+
+        # Initialise the ROS node once per process.  Done here (in the background
+        # spin thread) rather than in _start() so that _start() never blocks waiting
+        # for the ROS master to become available.
+        global _ros_node_initialized
+        if not _ros_node_initialized:
+            import rospy
+            rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
+            _ros_node_initialized = True
+            self._log.info("ROS node '%s' initialised", self._node_name)
+
         try:
             self._setup_ros_subscriptions()
             self._setup_ros_publishers()
