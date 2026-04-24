@@ -1100,13 +1100,16 @@ class RosBridgeComponent(Component):
 
         # Monitor thread: updates state if roslaunch exits on its own
         def _monitor() -> None:
-            if self._roslaunch_proc is not None:
-                self._roslaunch_proc.wait()
-                rc = self._roslaunch_proc.returncode
-                self._roslaunch_proc = None
-                self._roslaunch_state = "exited"
-                self._log.info("roslaunch exited with code %s", rc)
-                self.publish_state()
+            proc = self._roslaunch_proc
+            if proc is not None:
+                proc.wait()
+                rc = proc.returncode
+                # Only update state if stop() hasn't already claimed ownership
+                if self._roslaunch_proc is proc:
+                    self._roslaunch_proc = None
+                    self._roslaunch_state = "exited"
+                    self._log.info("roslaunch exited with code %s", rc)
+                    self.publish_state()
 
         threading.Thread(target=_monitor, daemon=True).start()
         return True
