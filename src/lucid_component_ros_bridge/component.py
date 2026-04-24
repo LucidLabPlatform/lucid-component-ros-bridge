@@ -905,8 +905,8 @@ class RosBridgeComponent(Component):
             self.publish_result("retry", request_id, ok=True, error="already connected")
             return
 
-        if force and self._ros_connected:
-            # Unregister subs/pubs only — roslaunch and latest_values are preserved
+        if force:
+            # Tear down stale ROS registrations — roslaunch and latest_values preserved
             for sub in list(self._ros_subs):
                 try:
                     sub.unregister()
@@ -921,6 +921,10 @@ class RosBridgeComponent(Component):
             self._ros_pubs.clear()
             self._pub_msg_types.clear()
             self._ros_connected = False
+            # Clear init flag so _reconnect_ros re-initialises rospy
+            # (required after ROS master restart — old registration is stale)
+            global _ros_node_initialized
+            _ros_node_initialized = False
             self.publish_state()
 
         self._retry_event.set()
