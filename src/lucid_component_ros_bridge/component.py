@@ -628,17 +628,7 @@ class RosBridgeComponent(Component):
             self._ros_pubs.clear()
             self._pub_msg_types.clear()
 
-        for sub in subs_to_close:
-            try:
-                sub.unregister()
-            except Exception:
-                self._log.exception("Failed to unregister ROS subscriber")
-
-        for pub in pubs_to_close:
-            try:
-                pub.unregister()
-            except Exception:
-                self._log.exception("Failed to unregister ROS publisher")
+        self._safe_unregister(subs_to_close, pubs_to_close)
 
         if final:
             # Full agent shutdown — release process-global rospy resources
@@ -741,6 +731,35 @@ class RosBridgeComponent(Component):
         except (OSError, socket.timeout):
             return False
 
+    def _safe_unregister(self, subs: list[Any], pubs: list[Any]) -> None:
+        """Unregister ROS subs/pubs only if the master is reachable.
+
+        When the master is unreachable, ``unregister()`` blocks on an XML-RPC
+        call that will never return — this previously wedged the spin thread
+        on master loss and made SIGTERM time out for 90s on shutdown.
+        Skipping the call leaks the master-side registration, but the master
+        is already gone; the registration is dropped when it next restarts
+        or is overwritten on the next ``_reconnect_ros``.
+        """
+        if not self._is_ros_master_reachable():
+            if subs or pubs:
+                self._log.warning(
+                    "ROS master unreachable — skipping unregister of %d subs and %d pubs",
+                    len(subs), len(pubs),
+                )
+            return
+
+        for sub in subs:
+            try:
+                sub.unregister()
+            except Exception:
+                self._log.exception("Failed to unregister ROS subscriber")
+        for pub in pubs:
+            try:
+                pub.unregister()
+            except Exception:
+                self._log.exception("Failed to unregister ROS publisher")
+
     def _teardown_ros(self) -> None:
         """Tear down ROS connections only — telemetry config and latest_values are preserved.
 
@@ -763,16 +782,7 @@ class RosBridgeComponent(Component):
             self._ros_pubs.clear()
             self._pub_msg_types.clear()
 
-        for sub in subs_to_close:
-            try:
-                sub.unregister()
-            except Exception:
-                pass
-        for pub in pubs_to_close:
-            try:
-                pub.unregister()
-            except Exception:
-                pass
+        self._safe_unregister(subs_to_close, pubs_to_close)
 
     def _reconnect_ros(self) -> bool:
         """Re-register ROS subs/pubs without touching telemetry or MQTT state.
@@ -805,16 +815,7 @@ class RosBridgeComponent(Component):
                 self._ros_subs.clear()
                 self._ros_pubs.clear()
                 self._pub_msg_types.clear()
-            for sub in subs_to_close:
-                try:
-                    sub.unregister()
-                except Exception:
-                    pass
-            for pub in pubs_to_close:
-                try:
-                    pub.unregister()
-                except Exception:
-                    pass
+            self._safe_unregister(subs_to_close, pubs_to_close)
             return False
 
     def _spin_loop(self) -> None:
@@ -952,16 +953,7 @@ class RosBridgeComponent(Component):
                 self._ros_subs.clear()
                 self._ros_pubs.clear()
                 self._pub_msg_types.clear()
-            for sub in subs_to_close:
-                try:
-                    sub.unregister()
-                except Exception:
-                    pass
-            for pub in pubs_to_close:
-                try:
-                    pub.unregister()
-                except Exception:
-                    pass
+            self._safe_unregister(subs_to_close, pubs_to_close)
             self._ros_connected = False
             self.publish_state()
 
