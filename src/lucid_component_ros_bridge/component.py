@@ -378,6 +378,10 @@ class RosBridgeComponent(Component):
         self._ros_subs: list[Any] = []
         self._ros_pubs: dict[str, Any] = {}  # command_name → rospy.Publisher
         self._pub_msg_types: dict[str, type] = {}  # command_name → msg class
+        # Guards _ros_subs / _ros_pubs / _pub_msg_types against concurrent
+        # mutation by handle_ros_publish (MQTT thread) and the spin/teardown
+        # paths. Held briefly — never across blocking I/O like unregister().
+        self._ros_state_lock = threading.Lock()
 
         self._spin_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -615,21 +619,26 @@ class RosBridgeComponent(Component):
         # Unregister all pubs/subs so this component stops all ROS network
         # activity. During a component-only restart we keep rospy alive
         # because rospy.init_node() can only be called once per process.
-        for sub in list(self._ros_subs):
+        # Snapshot under lock then unregister outside it — unregister() can
+        # block on master RPC and we must not hold the lock across that.
+        with self._ros_state_lock:
+            subs_to_close = list(self._ros_subs)
+            pubs_to_close = list(self._ros_pubs.values())
+            self._ros_subs.clear()
+            self._ros_pubs.clear()
+            self._pub_msg_types.clear()
+
+        for sub in subs_to_close:
             try:
                 sub.unregister()
             except Exception:
                 self._log.exception("Failed to unregister ROS subscriber")
 
-        for pub in list(self._ros_pubs.values()):
+        for pub in pubs_to_close:
             try:
                 pub.unregister()
             except Exception:
                 self._log.exception("Failed to unregister ROS publisher")
-
-        self._ros_subs.clear()
-        self._ros_pubs.clear()
-        self._pub_msg_types.clear()
 
         if final:
             # Full agent shutdown — release process-global rospy resources
@@ -682,7 +691,8 @@ class RosBridgeComponent(Component):
                 return _callback
 
             sub = rospy.Subscriber(ros_topic, msg_type, _make_callback(metric))
-            self._ros_subs.append(sub)
+            with self._ros_state_lock:
+                self._ros_subs.append(sub)
             self._log.info(
                 "Subscribed ROS topic %s → telemetry/%s", ros_topic, metric,
             )
@@ -705,8 +715,9 @@ class RosBridgeComponent(Component):
                 continue
 
             pub = rospy.Publisher(ros_topic, msg_type, queue_size=10)
-            self._ros_pubs[command] = pub
-            self._pub_msg_types[command] = msg_type
+            with self._ros_state_lock:
+                self._ros_pubs[command] = pub
+                self._pub_msg_types[command] = msg_type
             self._log.info(
                 "ROS publisher %s ← cmd/%s", ros_topic, command,
             )
@@ -731,27 +742,37 @@ class RosBridgeComponent(Component):
             return False
 
     def _teardown_ros(self) -> None:
-        """Tear down ROS connections only — telemetry config and latest_values are preserved."""
+        """Tear down ROS connections only — telemetry config and latest_values are preserved.
+
+        Note: between teardown and the next reconnect, the master may still
+        hold stale registrations pointing at us. Other nodes resolving these
+        topics during that window will be told we are the publisher and
+        rejected with "is not a publisher of …". Benign — they reconnect
+        once new registrations are in place.
+        """
         if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
             proc = self._roslaunch_proc
             self._roslaunch_proc = None
             self._roslaunch_state = "idle"
             self._kill_subprocess(proc, "roslaunch", sigint_timeout=5)
 
-        for sub in list(self._ros_subs):
+        with self._ros_state_lock:
+            subs_to_close = list(self._ros_subs)
+            pubs_to_close = list(self._ros_pubs.values())
+            self._ros_subs.clear()
+            self._ros_pubs.clear()
+            self._pub_msg_types.clear()
+
+        for sub in subs_to_close:
             try:
                 sub.unregister()
             except Exception:
                 pass
-        self._ros_subs.clear()
-
-        for pub in list(self._ros_pubs.values()):
+        for pub in pubs_to_close:
             try:
                 pub.unregister()
             except Exception:
                 pass
-        self._ros_pubs.clear()
-        self._pub_msg_types.clear()
 
     def _reconnect_ros(self) -> bool:
         """Re-register ROS subs/pubs without touching telemetry or MQTT state.
@@ -778,19 +799,22 @@ class RosBridgeComponent(Component):
             return True
         except Exception as exc:
             self._log.error("ROS reconnect failed: %s", exc)
-            for sub in list(self._ros_subs):
+            with self._ros_state_lock:
+                subs_to_close = list(self._ros_subs)
+                pubs_to_close = list(self._ros_pubs.values())
+                self._ros_subs.clear()
+                self._ros_pubs.clear()
+                self._pub_msg_types.clear()
+            for sub in subs_to_close:
                 try:
                     sub.unregister()
                 except Exception:
                     pass
-            self._ros_subs.clear()
-            for pub in list(self._ros_pubs.values()):
+            for pub in pubs_to_close:
                 try:
                     pub.unregister()
                 except Exception:
                     pass
-            self._ros_pubs.clear()
-            self._pub_msg_types.clear()
             return False
 
     def _spin_loop(self) -> None:
@@ -806,7 +830,16 @@ class RosBridgeComponent(Component):
                 self._retry_event.clear()
                 if self._stop_event.is_set():
                     break
-                if self._reconnect_ros():
+                try:
+                    ok = self._reconnect_ros()
+                except Exception:
+                    # Defensive: keep the spin thread alive even if reconnect raises
+                    # (e.g. rospy.init_node has already been called with different args).
+                    self._log.exception(
+                        "ROS reconnect raised — staying disconnected, send retry to try again"
+                    )
+                    ok = False
+                if ok:
                     self._ros_connected = True
                     self.publish_state()
                     self._log.info("ROS bridge active")
@@ -817,8 +850,11 @@ class RosBridgeComponent(Component):
                     self.publish_state()
                 continue
 
-            # Spin phase: periodic master health checks
-            while not self._stop_event.is_set():
+            # Spin phase: periodic master health checks. Also exits if an
+            # external cmd/retry flips _ros_connected to False — without that
+            # check, a fast master reboot (under MASTER_HEALTH_INTERVAL_S)
+            # would leave the retry signal stranded here.
+            while not self._stop_event.is_set() and self._ros_connected:
                 if not self._stop_event.wait(timeout=self._MASTER_HEALTH_INTERVAL_S):
                     # Timeout expired — check master
                     if not self._is_ros_master_reachable():
@@ -827,10 +863,13 @@ class RosBridgeComponent(Component):
             if self._stop_event.is_set():
                 break
 
-            self._log.warning("ROS master unreachable — tearing down connections")
-            self._teardown_ros()
-            self._ros_connected = False
-            self.publish_state()
+            if self._ros_connected:
+                # Inner loop exited because the master went down.
+                self._log.warning("ROS master unreachable — tearing down connections")
+                self._teardown_ros()
+                self._ros_connected = False
+                self.publish_state()
+            # else: external retry already tore down and flipped the flag.
 
     # -- retained publishing -----------------------------------------------
 
@@ -907,24 +946,23 @@ class RosBridgeComponent(Component):
 
         if force:
             # Tear down stale ROS registrations — roslaunch and latest_values preserved
-            for sub in list(self._ros_subs):
+            with self._ros_state_lock:
+                subs_to_close = list(self._ros_subs)
+                pubs_to_close = list(self._ros_pubs.values())
+                self._ros_subs.clear()
+                self._ros_pubs.clear()
+                self._pub_msg_types.clear()
+            for sub in subs_to_close:
                 try:
                     sub.unregister()
                 except Exception:
                     pass
-            self._ros_subs.clear()
-            for pub in list(self._ros_pubs.values()):
+            for pub in pubs_to_close:
                 try:
                     pub.unregister()
                 except Exception:
                     pass
-            self._ros_pubs.clear()
-            self._pub_msg_types.clear()
             self._ros_connected = False
-            # Clear init flag so _reconnect_ros re-initialises rospy
-            # (required after ROS master restart — old registration is stale)
-            global _ros_node_initialized
-            _ros_node_initialized = False
             self.publish_state()
 
         self._retry_event.set()
@@ -1298,8 +1336,9 @@ class RosBridgeComponent(Component):
             request_id = ""
             data = {}
 
-        pub = self._ros_pubs.get(command)
-        msg_type = self._pub_msg_types.get(command)
+        with self._ros_state_lock:
+            pub = self._ros_pubs.get(command)
+            msg_type = self._pub_msg_types.get(command)
 
         if pub is None or msg_type is None:
             self.publish_result(
@@ -1314,10 +1353,14 @@ class RosBridgeComponent(Component):
             self._log.info("Published to ROS via cmd/%s", command)
             self.publish_result(command, request_id, ok=True, error=None)
         except Exception as exc:
-            self._log.error("Failed to publish ROS message for cmd/%s: %s", command, exc)
-            self.publish_result(
-                command, request_id, ok=False, error=str(exc),
-            )
+            # "publish() to a closed topic" is expected during retry/teardown
+            # windows — demote to debug. Other errors (serialization, etc.)
+            # surface as errors.
+            if "closed topic" in str(exc).lower():
+                self._log.debug("cmd/%s skipped: %s", command, exc)
+            else:
+                self._log.error("Failed to publish ROS message for cmd/%s: %s", command, exc)
+            self.publish_result(command, request_id, ok=False, error=str(exc))
 
     def __getattr__(self, name: str) -> Any:
         """Route on_cmd_<command> calls to handle_ros_publish for configured publishers.
