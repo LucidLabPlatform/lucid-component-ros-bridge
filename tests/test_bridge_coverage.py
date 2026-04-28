@@ -24,12 +24,11 @@ import json
 import os
 import sys
 import textwrap
-import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
-from lucid_component_base import ComponentContext, ComponentStatus
+from lucid_component_base import ComponentStatus
 
 from lucid_component_ros_bridge import RosBridgeComponent
 from lucid_component_ros_bridge.component import (
@@ -44,7 +43,12 @@ from lucid_component_ros_bridge.component import (
     _topic_to_metric,
     _utc_iso,
 )
-from tests.conftest import FakeMqtt, make_context as _fake_context, write_yaml as _write_yaml
+from tests.conftest import make_context as _fake_context, write_yaml as _write_yaml
+
+
+def _activate(comp: RosBridgeComponent, request_id: str = "act") -> None:
+    """Drive the component into the ROS-active state via the cmd handler."""
+    comp.on_cmd_start_ros(json.dumps({"request_id": request_id}))
 
 
 def _comp_with_publishers(tmp_path: Path) -> RosBridgeComponent:
@@ -350,6 +354,8 @@ def test_subscription_callback_skips_oversized_payload(tmp_path, monkeypatch):
 
     with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
         comp.start()
+        _activate(comp)
+        comp.set_telemetry_config({"odom": {"enabled": True, "interval_s": 0.001, "change_threshold_percent": 0.0}})
 
         class BigMsg:
             __slots__ = ["data"]
@@ -398,6 +404,8 @@ def test_subscription_callback_publishes_within_limit(tmp_path, monkeypatch):
 
     with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
         comp.start()
+        _activate(comp)
+        comp.set_telemetry_config({"odom": {"enabled": True, "interval_s": 0.001, "change_threshold_percent": 0.0}})
 
         class SmallMsg:
             __slots__ = ["x"]
@@ -441,8 +449,8 @@ def test_max_auto_discover_publishers_from_yaml(tmp_path):
     assert comp._max_auto_discover_publishers == 10
 
 
-def test_max_auto_discover_publishers_exceeded_raises(tmp_path, monkeypatch):
-    """start() raises RuntimeError when discovered publishers exceed the cap."""
+def test_max_auto_discover_publishers_exceeded_returns_failure(tmp_path, monkeypatch):
+    """start_ros publishes ok=false when discovered publishers exceed the cap."""
     import lucid_component_ros_bridge.component as m
     monkeypatch.setattr(m, "_ros_node_initialized", False)
 
@@ -464,10 +472,15 @@ def test_max_auto_discover_publishers_exceeded_raises(tmp_path, monkeypatch):
     ]
 
     with patch.dict("sys.modules", {"rospy": fake_rospy}):
-        with pytest.raises(RuntimeError, match="max_auto_discover_publishers"):
-            comp.start()
+        comp.start()
+        _activate(comp)
 
-    assert comp.state.status == ComponentStatus.FAILED
+    results = [
+        json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/start_ros/result" in t
+    ]
+    assert results and results[-1]["ok"] is False
+    assert "max_auto_discover_publishers" in (results[-1]["error"] or "")
+    assert comp._ros_active is False
 
 
 def test_max_auto_discover_publishers_within_limit_starts_ok(tmp_path, monkeypatch):
@@ -492,7 +505,9 @@ def test_max_auto_discover_publishers_within_limit_starts_ok(tmp_path, monkeypat
 
     with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
         comp.start()
+        _activate(comp)
         assert comp.state.status == ComponentStatus.RUNNING
+        assert comp._ros_active is True
         comp.stop()
 
 
@@ -579,6 +594,7 @@ def test_handle_ros_publish_no_publisher_configured():
     """Command with no matching publisher → result ok=False."""
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
     comp.handle_ros_publish("unknown_cmd", json.dumps({"request_id": "r1"}))
     result_msgs = [
         json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/unknown_cmd/result" in t
@@ -596,6 +612,7 @@ def test_handle_ros_publish_publish_exception(tmp_path: Path):
     fake_pub.publish.side_effect = RuntimeError("ROS not running")
     fake_msg_type = MagicMock(return_value=MagicMock())
 
+    comp._ros_active = True
     comp._ros_pubs["cmd_vel"] = fake_pub
     comp._pub_msg_types["cmd_vel"] = fake_msg_type
 
@@ -621,6 +638,7 @@ def test_handle_ros_publish_success(tmp_path: Path):
     fake_msg_instance = MagicMock()
     fake_msg_type = MagicMock(return_value=fake_msg_instance)
 
+    comp._ros_active = True
     comp._ros_pubs["cmd_vel"] = fake_pub
     comp._pub_msg_types["cmd_vel"] = fake_msg_type
 
@@ -662,6 +680,7 @@ def test_getattr_routes_to_handle_ros_publish(tmp_path: Path):
 
     fake_pub = MagicMock()
     fake_msg_type = MagicMock(return_value=MagicMock())
+    comp._ros_active = True
     comp._ros_pubs["cmd_vel"] = fake_pub
     comp._pub_msg_types["cmd_vel"] = fake_msg_type
 
@@ -833,6 +852,7 @@ def test_start_runs_with_mocked_rospy(tmp_path: Path, monkeypatch):
     with patch.dict("sys.modules", {"rospy": fake_rospy}):
         comp.start()
         assert comp.state.status == ComponentStatus.RUNNING
+        _activate(comp)
         fake_rospy.init_node.assert_called_once()
         comp.stop()
 
@@ -889,7 +909,7 @@ def test_start_sources_setup_scripts_before_import(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
 
-    cfg_file = _write_yaml(tmp_path, f"""\
+    cfg_file = _write_yaml(tmp_path, """\
         node_name: test_node
         auto_discover: false
         setup_scripts:
@@ -971,8 +991,10 @@ def test_restart_skips_init_node(tmp_path: Path, monkeypatch):
 
     with patch.dict("sys.modules", {"rospy": fake_rospy}):
         comp1.start()
+        _activate(comp1)
         comp1.stop()
         comp2.start()
+        _activate(comp2)
         comp2.stop()
 
     assert fake_rospy.init_node.call_count == 1
@@ -1133,6 +1155,7 @@ def test_start_with_auto_discover_and_mocked_rospy(tmp_path: Path, monkeypatch):
 
     with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
         comp.start()
+        _activate(comp)
         assert comp.state.status == ComponentStatus.RUNNING
         # One subscription should have been auto-discovered
         assert len(comp._ros_subscriptions) == 1
@@ -1161,9 +1184,10 @@ def test_start_with_ros_subscription_msg_type_resolution_failure(tmp_path: Path,
 
     with patch.dict("sys.modules", {"rospy": fake_rospy}):
         comp.start()
+        _activate(comp)
         assert comp.state.status == ComponentStatus.RUNNING
-        # Sub was skipped due to import error, so ros_subs list is empty
-        assert comp._ros_subs == []
+        # Sub was skipped due to import error, so ros_subs dict is empty
+        assert comp._ros_subs == {}
         comp.stop()
 
 
@@ -1188,65 +1212,102 @@ def test_start_with_ros_publisher_msg_type_resolution_failure(tmp_path: Path, mo
 
     with patch.dict("sys.modules", {"rospy": fake_rospy}):
         comp.start()
+        _activate(comp)
         assert comp.state.status == ComponentStatus.RUNNING
         assert comp._ros_pubs == {}
         comp.stop()
 
 
 # ---------------------------------------------------------------------------
-# _spin_loop exits when stop_event is set
+# Watchdog tick exercises self-healing without a real ROS master
 # ---------------------------------------------------------------------------
 
-def test_spin_loop_exits_on_stop_event():
-    """_spin_loop terminates when _stop_event is set."""
-    ctx = _fake_context()
+def test_watchdog_tick_recreates_stale_subscription(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", True)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        watchdog_interval_s: 0.05
+        subscriber_stale_threshold_s: 0.01
+        ros_subscriptions:
+          - ros_topic: /odom
+            msg_type: nav_msgs/Odometry
+            telemetry_metric: odom
+        ros_publishers: []
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
 
     fake_rospy = _make_fake_rospy()
-    fake_rospy.is_shutdown.return_value = False
+    fake_rospy.get_published_topics.return_value = [("/odom", "nav_msgs/Odometry")]
+    fake_nav_msgs = MagicMock()
+    fake_nav_msgs.Odometry = MagicMock()
 
-    call_count = 0
-    def fake_sleep():
-        nonlocal call_count
-        call_count += 1
-        if call_count >= 2:
-            comp._stop_event.set()
+    create_calls = []
+    def fake_subscriber(topic, msg_type, callback):
+        create_calls.append(topic)
+        sub = MagicMock()
+        sub.unregister = MagicMock()
+        return sub
 
-    fake_rospy.Rate.return_value.sleep = fake_sleep
+    fake_rospy.Subscriber.side_effect = fake_subscriber
 
-    comp._stop_event.clear()
-    with patch.dict("sys.modules", {"rospy": fake_rospy}):
-        t = threading.Thread(target=comp._spin_loop)
-        t.start()
-        t.join(timeout=3.0)
+    monkeypatch.setattr(comp, "_is_ros_master_reachable", lambda: True)
 
-    assert not t.is_alive()
-    assert call_count >= 2
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
+        # Seed a subscription manually so we don't need to spin the activator
+        assert comp._create_subscription({
+            "ros_topic": "/odom",
+            "msg_type": "nav_msgs/Odometry",
+            "telemetry_metric": "odom",
+        })
+        # Force the timestamp into the past so the watchdog treats it as stale.
+        import time as _t
+        comp._sub_last_msg_at["/odom"] = _t.monotonic() - 60
+        comp._watchdog_tick()
+
+    # Subscription was unregistered and recreated → Subscriber called twice.
+    assert len(create_calls) == 2
 
 
-def test_spin_loop_exits_on_ros_interrupt():
-    """_spin_loop exits cleanly when rospy.ROSInterruptException is raised."""
-    ctx = _fake_context()
+def test_watchdog_tick_recreates_missing_publisher(tmp_path: Path, monkeypatch):
+    import lucid_component_ros_bridge.component as m
+    monkeypatch.setattr(m, "_ros_node_initialized", True)
+
+    cfg_file = _write_yaml(tmp_path, """\
+        node_name: test_node
+        auto_discover: false
+        ros_subscriptions: []
+        ros_publishers:
+          - ros_topic: /cmd_vel
+            msg_type: geometry_msgs/Twist
+            command: cmd_vel
+    """)
+    ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
 
-    fake_rospy = MagicMock()
-    fake_rospy.is_shutdown.return_value = False
+    fake_rospy = _make_fake_rospy()
+    fake_rospy.get_published_topics.return_value = []
+    fake_geom_msgs = MagicMock()
+    fake_geom_msgs.Twist = MagicMock()
 
-    class FakeROSInterruptException(Exception):
-        pass
+    pub_calls = []
+    def fake_publisher(topic, msg_type, queue_size=None):
+        pub_calls.append(topic)
+        return MagicMock()
 
-    fake_rospy.ROSInterruptException = FakeROSInterruptException
-    fake_rate = MagicMock()
-    fake_rate.sleep.side_effect = FakeROSInterruptException("interrupted")
-    fake_rospy.Rate.return_value = fake_rate
+    fake_rospy.Publisher.side_effect = fake_publisher
 
-    comp._stop_event.clear()
-    with patch.dict("sys.modules", {"rospy": fake_rospy}):
-        t = threading.Thread(target=comp._spin_loop)
-        t.start()
-        t.join(timeout=3.0)
+    monkeypatch.setattr(comp, "_is_ros_master_reachable", lambda: True)
 
-    assert not t.is_alive()
+    with patch.dict("sys.modules", {"rospy": fake_rospy, "geometry_msgs.msg": fake_geom_msgs}):
+        # _ros_pubs is empty → watchdog must recreate the configured publisher.
+        comp._watchdog_tick()
+
+    assert pub_calls == ["/cmd_vel"]
+    assert "cmd_vel" in comp._ros_pubs
 
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1346,8 @@ def test_ros_subscription_callback_publishes_telemetry(tmp_path: Path, monkeypat
 
     with patch.dict("sys.modules", {"rospy": fake_rospy, "nav_msgs.msg": fake_nav_msgs}):
         comp.start()
+        _activate(comp)
+        comp.set_telemetry_config({"odom": {"enabled": True, "interval_s": 0.001, "change_threshold_percent": 0.0}})
 
         assert len(captured_callbacks) == 1
 

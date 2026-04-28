@@ -8,12 +8,11 @@ ROS imports are mocked so tests run in any CI/dev environment.
 from __future__ import annotations
 
 import json
-import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from lucid_component_base import ComponentContext, ComponentStatus
+from lucid_component_base import ComponentStatus
 
 from lucid_component_ros_bridge import RosBridgeComponent
 from tests.conftest import make_context as _fake_context, write_yaml as _write_yaml
@@ -546,6 +545,7 @@ def test_rosbag_start_rejects_when_default_data_missing(
     monkeypatch.chdir(tmp_path)
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
     comp.on_cmd_rosbag_start(json.dumps({"request_id": "r1"}))
     results = [
         json.loads(p) for t, p, _, _ in ctx.mqtt.published if "evt/rosbag_start/result" in t
@@ -562,6 +562,7 @@ def test_rosbag_start_rejects_non_string_output_dir(
     (tmp_path / "data").mkdir()
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
     comp.on_cmd_rosbag_start(
         json.dumps({"request_id": "r_bad", "data": {"output_dir": 123}})
     )
@@ -580,6 +581,7 @@ def test_rosbag_start_succeeds_when_data_dir_exists(
     (tmp_path / "data").mkdir()
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
         mock_proc.poll.return_value = None
@@ -606,6 +608,7 @@ def test_rosbag_start_rejects_when_already_recording(
     (tmp_path / "data").mkdir()
     ctx = _fake_context()
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
     mock_proc = MagicMock()
     mock_proc.poll.return_value = None  # still running
     comp._rosbag_proc = mock_proc
@@ -708,6 +711,7 @@ def test_roslaunch_start_uses_yaml_defaults(tmp_path: Path):
     """)
     ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
 
     # Patch Popen so we don't actually launch anything
     with patch("subprocess.Popen") as mock_popen:
@@ -717,6 +721,13 @@ def test_roslaunch_start_uses_yaml_defaults(tmp_path: Path):
         mock_popen.return_value = mock_proc
 
         comp.on_cmd_roslaunch_start(json.dumps({"request_id": "r1"}))
+
+        # Wait briefly for daemon thread to invoke Popen
+        import time as _t
+        for _ in range(50):
+            if mock_popen.call_count:
+                break
+            _t.sleep(0.02)
 
         mock_popen.assert_called_once()
         cmd_parts = mock_popen.call_args[0][0]
@@ -741,6 +752,7 @@ def test_roslaunch_start_payload_overrides_args(tmp_path: Path):
     """)
     ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
 
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
@@ -752,6 +764,12 @@ def test_roslaunch_start_payload_overrides_args(tmp_path: Path):
             "request_id": "r1",
             "data": {"args": {"robot_ip": "10.0.0.2", "lidar": "true"}},
         }))
+
+        import time as _t
+        for _ in range(50):
+            if mock_popen.call_count:
+                break
+            _t.sleep(0.02)
 
         cmd_parts = mock_popen.call_args[0][0]
         # robot_ip overridden, camera kept from defaults, lidar added
@@ -772,6 +790,7 @@ def test_roslaunch_start_legacy_string_args(tmp_path: Path):
     """)
     ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
+    comp._ros_active = True
 
     with patch("subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
@@ -784,13 +803,19 @@ def test_roslaunch_start_legacy_string_args(tmp_path: Path):
             "data": {"args": "foo:=bar baz:=qux"},
         }))
 
+        import time as _t
+        for _ in range(50):
+            if mock_popen.call_count:
+                break
+            _t.sleep(0.02)
+
         cmd_parts = mock_popen.call_args[0][0]
         assert "foo:=bar" in cmd_parts
         assert "baz:=qux" in cmd_parts
 
 
-def test_roslaunch_start_already_running(tmp_path: Path):
-    """Rejects start when a process is already running."""
+def test_roslaunch_start_rejects_when_ros_idle(tmp_path: Path):
+    """Idle bridge rejects roslaunch_start with 'call cmd/start_ros first'."""
     cfg_file = _write_yaml(tmp_path, """\
         node_name: test
         roslaunch:
@@ -801,12 +826,7 @@ def test_roslaunch_start_already_running(tmp_path: Path):
     """)
     ctx = _fake_context(config={"config_path": str(cfg_file)})
     comp = RosBridgeComponent(ctx)
-
-    # Simulate a running process
-    mock_proc = MagicMock()
-    mock_proc.poll.return_value = None  # still running
-    comp._roslaunch_proc = mock_proc
-
+    # _ros_active defaults to False — handler should reject without spawning anything.
     comp.on_cmd_roslaunch_start(json.dumps({"request_id": "r1"}))
 
     results = [
@@ -815,4 +835,4 @@ def test_roslaunch_start_already_running(tmp_path: Path):
     ]
     assert len(results) == 1
     assert results[0]["ok"] is False
-    assert "Already running" in results[0]["error"]
+    assert "start_ros" in (results[0].get("error") or "")

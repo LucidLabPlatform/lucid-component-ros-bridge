@@ -54,6 +54,24 @@ max_auto_discover_publishers: 50
 # Set to null (default) for no limit.
 max_telemetry_payload_bytes: null
 
+# ── Watchdog ────────────────────────────────────────────────────────────
+# The watchdog runs only while the component is ROS-active (after cmd/start_ros).
+# Each tick it verifies that subscribers are still receiving messages and that
+# every cfg'd publisher is registered. Dead subscribers are recreated when the
+# topic still has publishers; missing publishers are recreated unconditionally.
+watchdog_interval_s: 5.0
+# A subscription is considered dead when no callback has fired for this many
+# seconds AND the ROS master still lists publishers for the topic. Tune lower
+# for high-rate topics; raise for low-rate / event-driven ones.
+subscriber_stale_threshold_s: 10.0
+
+# ── Display (optional) ──────────────────────────────────────────────────
+# When set, roslaunch / rosbag subprocesses inherit DISPLAY=<value> so tools
+# like rviz or cv_imshow can render windows on the local Xorg server.
+# Leave null for headless agents.
+# Example: display: ":0"
+display: null
+
 # Topics to skip during auto-discovery. Only used when auto_discover is true.
 # Example:
 # exclude_topics:

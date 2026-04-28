@@ -6,13 +6,24 @@ Enables any ROS 1 device to participate as a LUCID agent by translating:
   - LUCID commands → ROS topic publishes
 
 Two modes:
-  auto_discover: true   — queries the ROS master for all published topics at
-                          startup and bridges them automatically.
+  auto_discover: true   — queries the ROS master at start_ros for all
+                          published topics and bridges them automatically.
   auto_discover: false  — uses only the explicit ros_subscriptions /
                           ros_publishers lists from the YAML.
 
 Both modes can coexist: auto-discovered topics are merged with any explicit
 entries from the YAML (explicit entries take priority for the same topic).
+
+Lifecycle:
+  _start()        — minimal: load cfg, subscribe to MQTT cmds. The ROS layer
+                    stays idle. Mirrors chrony's pattern.
+  cmd/start_ros   — initialise rospy, register subs/pubs, start watchdog.
+  cmd/stop_ros    — unregister subs/pubs, stop watchdog. Idempotent.
+
+A self-healing watchdog runs only while ros_active. Each tick it verifies
+the master is reachable, recreates dead subscriptions (no callback for
+> subscriber_stale_threshold_s while the topic still has publishers), and
+recreates any cfg'd publisher missing from _ros_pubs.
 
 Configuration is loaded from ros_bridge.yaml shipped alongside this module.
 To override, set "config_path" in the component context config to point at
@@ -42,12 +53,12 @@ from typing import Any
 
 import yaml
 
-from lucid_component_base import Component, ComponentContext, ComponentStatus
+from lucid_component_base import Component, ComponentContext
 
 logger = logging.getLogger(__name__)
 
 # rospy.init_node() may only be called once per Python process.
-# This flag prevents a second call when the component is restarted.
+# This flag prevents a second call when start_ros is invoked again.
 _ros_node_initialized: bool = False
 
 # Default config: shipped alongside this module
@@ -62,7 +73,6 @@ def _load_bridge_config_with_source(
     context_config: dict[str, Any],
 ) -> tuple[dict[str, Any], Path | None]:
     """Load the bridge YAML config and return the selected source path."""
-    # 1. Explicit override
     explicit = context_config.get("config_path")
     if explicit:
         p = Path(explicit).expanduser().resolve()
@@ -72,7 +82,6 @@ def _load_bridge_config_with_source(
         with p.open("r", encoding="utf-8") as f:
             return (yaml.safe_load(f) or {}, p)
 
-    # 2. Working-directory override
     local = Path("ros_bridge.yaml")
     if local.is_file():
         p = local.resolve()
@@ -80,7 +89,6 @@ def _load_bridge_config_with_source(
         with p.open("r", encoding="utf-8") as f:
             return (yaml.safe_load(f) or {}, p)
 
-    # 3. Default shipped with package
     if _DEFAULT_CONFIG_PATH.is_file():
         p = _DEFAULT_CONFIG_PATH.resolve()
         logger.info("Loading ROS bridge config from package default: %s", p)
@@ -89,6 +97,12 @@ def _load_bridge_config_with_source(
 
     logger.warning("No ros_bridge.yaml found — starting with empty config")
     return ({}, None)
+
+
+def _load_bridge_config(context_config: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compat wrapper that drops the source path from the tuple."""
+    cfg, _ = _load_bridge_config_with_source(context_config)
+    return cfg
 
 
 def _resolve_setup_script_paths(
@@ -170,18 +184,12 @@ def _source_setup_scripts(paths: list[Path]) -> dict[str, str]:
 
 
 def _topic_to_metric(ros_topic: str) -> str:
-    """Convert a ROS topic name to a LUCID telemetry metric name.
-
-    '/camera/rgb/image_raw' → 'camera_rgb_image_raw'
-    """
+    """'/camera/rgb/image_raw' → 'camera_rgb_image_raw'"""
     return ros_topic.strip("/").replace("/", "_")
 
 
 def _topic_to_command(ros_topic: str) -> str:
-    """Convert a ROS topic name to a LUCID command name.
-
-    '/cmd_vel' → 'cmd_vel'
-    """
+    """'/cmd_vel' → 'cmd_vel'"""
     return ros_topic.strip("/").replace("/", "_")
 
 
@@ -190,11 +198,7 @@ def _discover_ros_topics(
     explicit_sub_topics: set[str],
     explicit_pub_topics: set[str],
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Query the ROS master for all published topics and build subscription/publisher entries.
-
-    Returns (discovered_subscriptions, discovered_publishers).
-    Topics in exclude_topics or already in explicit lists are skipped.
-    """
+    """Query the ROS master and build subscription/publisher entries."""
     import rospy
 
     try:
@@ -211,7 +215,6 @@ def _discover_ros_topics(
             logger.info("Auto-discovery: excluding %s", ros_topic)
             continue
 
-        # Auto-subscribe (ROS → LUCID telemetry)
         if ros_topic not in explicit_sub_topics:
             discovered_subs.append({
                 "ros_topic": ros_topic,
@@ -219,7 +222,6 @@ def _discover_ros_topics(
                 "telemetry_metric": _topic_to_metric(ros_topic),
             })
 
-        # Auto-publish (LUCID cmd → ROS) for the same topics
         if ros_topic not in explicit_pub_topics:
             discovered_pubs.append({
                 "ros_topic": ros_topic,
@@ -241,7 +243,6 @@ def _resolve_msg_type(msg_type_str: str) -> type:
     'geometry_msgs.msg.Twist' (Python import style).
     """
     if "/" in msg_type_str:
-        # ROS 1 convention: "package/MessageType" → package.msg module
         parts = msg_type_str.split("/")
         if len(parts) != 2:
             raise ValueError(
@@ -251,7 +252,6 @@ def _resolve_msg_type(msg_type_str: str) -> type:
         package, class_name = parts
         module_path = f"{package}.msg"
     else:
-        # Python import style: "geometry_msgs.msg.Twist"
         parts = msg_type_str.rsplit(".", 1)
         if len(parts) != 2:
             raise ValueError(
@@ -265,23 +265,17 @@ def _resolve_msg_type(msg_type_str: str) -> type:
 
 
 def _msg_to_dict(msg: Any) -> dict[str, Any]:
-    """Convert a ROS 1 message to a JSON-serialisable dict.
-
-    Uses rospy's message_converter if available, otherwise falls back
-    to iterating __slots__ (standard on all genpy messages).
-    """
+    """Convert a ROS 1 message to a JSON-serialisable dict."""
     try:
         from rospy_message_converter import message_converter
         return message_converter.convert_ros_message_to_dictionary(msg)
     except ImportError:
         pass
 
-    # Fallback: iterate __slots__ (genpy messages expose fields this way)
     result: dict[str, Any] = {}
     for slot in getattr(msg, "__slots__", []):
         value = getattr(msg, slot, None)
         if hasattr(value, "__slots__") and hasattr(value, "_type"):
-            # Nested ROS message
             result[slot] = _msg_to_dict(value)
         elif isinstance(value, (list, tuple)):
             result[slot] = [
@@ -303,7 +297,6 @@ def _dict_to_msg(data: dict[str, Any], msg_type: type) -> Any:
     except (ImportError, AttributeError):
         pass
 
-    # Fallback: manual field assignment
     msg = msg_type()
     for key, value in data.items():
         if not hasattr(msg, key):
@@ -319,9 +312,14 @@ def _dict_to_msg(data: dict[str, Any], msg_type: type) -> Any:
 class RosBridgeComponent(Component):
     """Bridges ROS 1 topics to/from LUCID MQTT topics.
 
+    Idle by default. cmd/start_ros activates the ROS layer (init node,
+    register subs/pubs, start watchdog). cmd/stop_ros tears it back down.
+    The watchdog self-heals dead subscribers and missing publishers.
+
     Retained: metadata, status, state, cfg.
     Telemetry: one metric per configured ROS subscription.
-    Commands: reset, ping, cfg/set, plus one per configured ROS publisher.
+    Commands: ping, start_ros, stop_ros, cfg/set, roslaunch-start/stop,
+              rosbag-start/stop, plus one per configured ROS publisher.
     """
 
     def __init__(self, context: ComponentContext) -> None:
@@ -344,9 +342,7 @@ class RosBridgeComponent(Component):
         self._ros_subscriptions: list[dict[str, str]] = self._bridge_cfg.get("ros_subscriptions") or []
         self._ros_publishers: list[dict[str, str]] = self._bridge_cfg.get("ros_publishers") or []
         # Set of configured publisher command names — built at init time so
-        # __getattr__ can validate commands before _ros_pubs is populated
-        # (the agent subscribes to cmd topics during startup, before the ROS
-        # spin loop connects and fills _ros_pubs).
+        # __getattr__ can route cmd topics before _ros_pubs is populated.
         self._ros_publisher_commands: set[str] = {
             p["command"] for p in self._ros_publishers if p.get("command")
         }
@@ -355,6 +351,19 @@ class RosBridgeComponent(Component):
             self._setup_scripts,
             config_source_path=self._bridge_cfg_path,
         )
+
+        # Watchdog tunables
+        self._watchdog_interval_s: float = float(
+            self._bridge_cfg.get("watchdog_interval_s", 5.0)
+        )
+        self._subscriber_stale_threshold_s: float = float(
+            self._bridge_cfg.get("subscriber_stale_threshold_s", 10.0)
+        )
+
+        # Display override for roslaunch/rosbag subprocesses (e.g. ":0").
+        # When set, child processes can render rviz/cv windows to the local Xorg.
+        raw_display = self._bridge_cfg.get("display")
+        self._display: str | None = str(raw_display) if raw_display else None
 
         # Roslaunch configuration
         roslaunch_raw = self._bridge_cfg.get("roslaunch") or {}
@@ -368,22 +377,24 @@ class RosBridgeComponent(Component):
 
         # Per-instance ROS env overrides for roslaunch/rosbag subprocesses.
         # Allows multiple ros_bridge instances to target different ROS masters.
-        # Applied via subprocess.Popen(env=...) — does NOT affect the agent's
-        # rospy connection (which is process-wide, set by systemd/setup_scripts).
         self._ros_env: dict[str, str] = {
             str(k): str(v) for k, v in (self._bridge_cfg.get("ros_env") or {}).items()
         }
 
-        # ROS runtime state (populated on start)
-        self._ros_subs: list[Any] = []
-        self._ros_pubs: dict[str, Any] = {}  # command_name → rospy.Publisher
-        self._pub_msg_types: dict[str, type] = {}  # command_name → msg class
-        # Guards _ros_subs / _ros_pubs / _pub_msg_types against concurrent
-        # mutation by handle_ros_publish (MQTT thread) and the spin/teardown
-        # paths. Held briefly — never across blocking I/O like unregister().
+        # ROS runtime state — populated only while _ros_active.
+        # _ros_subs / _ros_pubs are keyed by ros_topic / command for watchdog lookup.
+        self._ros_subs: dict[str, Any] = {}
+        self._ros_pubs: dict[str, Any] = {}
+        self._pub_msg_types: dict[str, type] = {}
+        self._sub_metric_for_topic: dict[str, str] = {}
+        self._sub_msg_type_str: dict[str, str] = {}
+        self._sub_last_msg_at: dict[str, float] = {}
+        # Guards _ros_subs / _ros_pubs / _pub_msg_types and the related maps.
+        # Held briefly — never across blocking I/O like unregister().
         self._ros_state_lock = threading.Lock()
 
-        self._spin_thread: threading.Thread | None = None
+        self._ros_active: bool = False
+        self._watchdog_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
         # Latest values received from ROS (for state payload)
@@ -398,18 +409,16 @@ class RosBridgeComponent(Component):
         self._rosbag_path: str | None = None
         self._rosbag_start_time: float | None = None
 
-        # ROS connection health (set True once subs/pubs are live)
-        self._ros_connected: bool = False
-
-        # Set by on_cmd_retry (or at startup) to wake the spin loop's reconnect wait
-        self._retry_event = threading.Event()
-
     @property
     def component_id(self) -> str:
         return self.context.component_id
 
     def capabilities(self) -> list[str]:
-        caps = ["reset", "ping", "retry", "roslaunch-start", "roslaunch-stop", "rosbag-start", "rosbag-stop"]
+        caps = [
+            "ping", "reset", "start_ros", "stop_ros",
+            "roslaunch-start", "roslaunch-stop",
+            "rosbag-start", "rosbag-stop",
+        ]
         for pub_cfg in self._ros_publishers:
             command = pub_cfg.get("command", "")
             if command:
@@ -436,12 +445,15 @@ class RosBridgeComponent(Component):
         return out
 
     def get_state_payload(self) -> dict[str, Any]:
+        with self._ros_state_lock:
+            subs_active = len(self._ros_subs)
+            pubs_active = len(self._ros_pubs)
         with self._values_lock:
             return {
                 "node_name": self._node_name,
-                "ros_connected": self._ros_connected,
-                "subscriptions_active": len(self._ros_subs),
-                "publishers_active": len(self._ros_pubs),
+                "ros_active": self._ros_active,
+                "subscriptions_active": subs_active,
+                "publishers_active": pubs_active,
                 "roslaunch_state": self._roslaunch_state,
                 "roslaunch_package": self._roslaunch_package,
                 "roslaunch_launch_file": self._roslaunch_launch_file,
@@ -460,6 +472,9 @@ class RosBridgeComponent(Component):
             "ros_publishers": self._ros_publishers,
             "setup_scripts": self._setup_scripts,
             "ros_env": dict(self._ros_env),
+            "watchdog_interval_s": self._watchdog_interval_s,
+            "subscriber_stale_threshold_s": self._subscriber_stale_threshold_s,
+            "display": self._display,
             "roslaunch": {
                 "package": self._roslaunch_package,
                 "launch_file": self._roslaunch_launch_file,
@@ -471,7 +486,7 @@ class RosBridgeComponent(Component):
         s = copy.deepcopy(super().schema())
         s["publishes"]["state"]["fields"].update({
             "node_name": {"type": "string"},
-            "ros_connected": {"type": "boolean"},
+            "ros_active": {"type": "boolean"},
             "subscriptions_active": {"type": "integer"},
             "publishers_active": {"type": "integer"},
             "roslaunch_state": {
@@ -486,8 +501,6 @@ class RosBridgeComponent(Component):
                 "type": "object",
                 "description": "Latest ROS message values per subscription",
             },
-        })
-        s["publishes"]["state"]["fields"].update({
             "roslaunch_package": {"type": "string"},
             "roslaunch_launch_file": {"type": "string"},
         })
@@ -497,6 +510,9 @@ class RosBridgeComponent(Component):
             "max_auto_discover_publishers": {"type": "integer"},
             "max_telemetry_payload_bytes": {"type": "integer"},
             "exclude_topics": {"type": "array", "items": {"type": "string"}},
+            "watchdog_interval_s": {"type": "number"},
+            "subscriber_stale_threshold_s": {"type": "number"},
+            "display": {"type": ["string", "null"]},
             "roslaunch": {
                 "type": "object",
                 "fields": {
@@ -507,7 +523,8 @@ class RosBridgeComponent(Component):
             },
         })
         s["subscribes"].update({
-            "cmd/retry": {"fields": {"force": {"type": "boolean", "description": "If true, force re-registration of subs/pubs even when already connected (use after docker restart). Does not clear latest_values or touch roslaunch."}}},
+            "cmd/start_ros": {"fields": {}},
+            "cmd/stop_ros": {"fields": {}},
             "cmd/roslaunch-start": {
                 "fields": {
                     "package": {"type": "string", "description": "Defaults to config roslaunch.package"},
@@ -530,11 +547,18 @@ class RosBridgeComponent(Component):
     # -- lifecycle --------------------------------------------------------
 
     def _start(self) -> None:
+        """Idle bring-up: source env, publish retained state. No ROS interaction.
+
+        Mirrors chrony's pattern — the component is observable and addressable
+        on MQTT, but ROS subscribers/publishers are not registered until
+        cmd/start_ros is received.
+        """
         if self._setup_script_paths:
             _source_setup_scripts(self._setup_script_paths)
 
+        # Verify rospy is importable so we fail fast if the env is wrong.
         try:
-            import rospy  # noqa: F401 — verify rospy is importable before starting spin thread
+            import rospy  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "rospy is not available. Install ROS 1 and source both "
@@ -542,69 +566,16 @@ class RosBridgeComponent(Component):
                 "before running the ROS bridge component."
             ) from exc
 
-        # rospy.init_node() is intentionally deferred to _reconnect_ros() (called from
-        # the background spin thread) so that _start() returns immediately even when
-        # the ROS master is not yet running.  Calling init_node() here blocks until the
-        # master is reachable, which prevents other components from receiving their MQTT
-        # command subscriptions.
-
-        # Auto-discover topics if enabled and master is already reachable at start time.
-        # If master is down, discovery is skipped — use reset() once roscore is up.
-        # init_node() is called here only when the master is already up (safe, fast path).
-        if self._auto_discover:
-            if self._is_ros_master_reachable():
-                global _ros_node_initialized
-                if not _ros_node_initialized:
-                    import rospy as _rospy
-                    _rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
-                    _ros_node_initialized = True
-                    self._log.info("ROS node '%s' initialised (auto_discover path)", self._node_name)
-                explicit_sub_topics = {s["ros_topic"] for s in self._ros_subscriptions}
-                explicit_pub_topics = {p["ros_topic"] for p in self._ros_publishers}
-                discovered_subs, discovered_pubs = _discover_ros_topics(
-                    self._exclude_topics, explicit_sub_topics, explicit_pub_topics,
-                )
-                if len(discovered_pubs) > self._max_auto_discover_publishers:
-                    raise RuntimeError(
-                        f"auto_discover found {len(discovered_pubs)} publishers, which exceeds "
-                        f"max_auto_discover_publishers={self._max_auto_discover_publishers}. "
-                        "Raise the limit in ros_bridge.yaml or add topics to exclude_topics."
-                    )
-                self._ros_subscriptions.extend(discovered_subs)
-                self._ros_publishers.extend(discovered_pubs)
-            else:
-                self._log.warning(
-                    "auto_discover enabled but ROS master is unreachable — "
-                    "skipping discovery. Send reset once roscore is running."
-                )
-
-        # Build telemetry config from subscriptions (YAML entries only if master was down).
-        # Done here so user-set telemetry config survives a retry without being wiped.
-        telemetry_cfg = {
-            sub["telemetry_metric"]: {
-                "enabled": False,
-                "interval_s": 0.1,
-                "change_threshold_percent": 0.0,
-            }
-            for sub in self._ros_subscriptions
-        }
-        self.set_telemetry_config(telemetry_cfg)
+        # Telemetry config covers configured subscriptions; auto-discovered
+        # metrics are added when start_ros runs auto-discovery.
+        self.set_telemetry_config(self._build_telemetry_cfg(self._ros_subscriptions))
 
         self._publish_all_retained()
 
-        # Start spin loop. _retry_event is set immediately so the loop attempts
-        # to connect on startup without waiting for an explicit retry command.
-        self._stop_event.clear()
-        self._retry_event.set()
-        self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
-        self._spin_thread.start()
+    def _stop(self) -> None:
+        if self._ros_active:
+            self._deactivate_ros()
 
-    def _stop(self, *, final: bool = False) -> None:
-        self._ros_connected = False
-        self._stop_event.set()
-        self._retry_event.set()  # wake spin loop if it's waiting for a retry
-
-        # Stop any running subprocesses
         self._kill_subprocess(self._roslaunch_proc, "roslaunch", sigint_timeout=15)
         self._roslaunch_proc = None
         self._roslaunch_state = "idle"
@@ -612,109 +583,197 @@ class RosBridgeComponent(Component):
         self._rosbag_proc = None
         self._rosbag_state = "idle"
 
-        if self._spin_thread is not None:
-            self._spin_thread.join(timeout=5.0)
-            self._spin_thread = None
+        # Final agent shutdown: release process-global rospy resources so
+        # the process can exit cleanly instead of hanging in atexit.
+        try:
+            import rospy
+            if rospy.core.is_initialized():
+                self._log.info("Final shutdown: calling rospy.signal_shutdown()")
+                rospy.signal_shutdown("agent shutdown")
+        except Exception:
+            self._log.exception("Error during rospy.signal_shutdown()")
 
-        # Unregister all pubs/subs so this component stops all ROS network
-        # activity. During a component-only restart we keep rospy alive
-        # because rospy.init_node() can only be called once per process.
-        # Snapshot under lock then unregister outside it — unregister() can
-        # block on master RPC and we must not hold the lock across that.
+        self._log.info("ROS bridge stopped")
+
+    # -- ROS activation ---------------------------------------------------
+
+    def _activate_ros(self) -> None:
+        """Initialise rospy, register all subs/pubs, start the watchdog.
+
+        Caller holds responsibility for guarding against concurrent activation
+        (start_ros / stop_ros are dispatched on the MQTT thread, serialised by
+        the component base's executor — but we still gate on _ros_active).
+        """
+        global _ros_node_initialized
+        import rospy
+
+        if not _ros_node_initialized or not rospy.core.is_initialized():
+            rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
+            _ros_node_initialized = True
+            self._log.info("ROS node '%s' initialised", self._node_name)
+
+        if self._auto_discover:
+            explicit_sub_topics = {s["ros_topic"] for s in self._ros_subscriptions}
+            explicit_pub_topics = {p["ros_topic"] for p in self._ros_publishers}
+            discovered_subs, discovered_pubs = _discover_ros_topics(
+                self._exclude_topics, explicit_sub_topics, explicit_pub_topics,
+            )
+            if len(discovered_pubs) > self._max_auto_discover_publishers:
+                raise RuntimeError(
+                    f"auto_discover found {len(discovered_pubs)} publishers, exceeds "
+                    f"max_auto_discover_publishers={self._max_auto_discover_publishers}. "
+                    "Raise the limit in ros_bridge.yaml or add topics to exclude_topics."
+                )
+            # Merge discovered into the cfg lists (explicit entries win on dupes,
+            # which discovery already filtered above).
+            for sub in discovered_subs:
+                if not any(s["ros_topic"] == sub["ros_topic"] for s in self._ros_subscriptions):
+                    self._ros_subscriptions.append(sub)
+            for pub in discovered_pubs:
+                if not any(p["ros_topic"] == pub["ros_topic"] for p in self._ros_publishers):
+                    self._ros_publishers.append(pub)
+                    if pub.get("command"):
+                        self._ros_publisher_commands.add(pub["command"])
+
+        self.set_telemetry_config(self._build_telemetry_cfg(self._ros_subscriptions))
+
+        for sub_cfg in list(self._ros_subscriptions):
+            self._create_subscription(sub_cfg)
+        for pub_cfg in list(self._ros_publishers):
+            self._create_publisher(pub_cfg)
+
+        self._stop_event.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="ros_bridge_watchdog",
+        )
+        self._watchdog_thread.start()
+
+        self._ros_active = True
+        self._log.info(
+            "ROS bridge active: %d subs, %d pubs",
+            len(self._ros_subs), len(self._ros_pubs),
+        )
+
+    def _deactivate_ros(self) -> None:
+        """Stop the watchdog and unregister all subs/pubs."""
+        self._stop_event.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=self._watchdog_interval_s + 2)
+            self._watchdog_thread = None
+
         with self._ros_state_lock:
-            subs_to_close = list(self._ros_subs)
+            subs_to_close = list(self._ros_subs.values())
             pubs_to_close = list(self._ros_pubs.values())
             self._ros_subs.clear()
             self._ros_pubs.clear()
             self._pub_msg_types.clear()
+            self._sub_metric_for_topic.clear()
+            self._sub_msg_type_str.clear()
+            self._sub_last_msg_at.clear()
 
-        self._safe_unregister(subs_to_close, pubs_to_close)
-
-        if final:
-            # Full agent shutdown — release process-global rospy resources
-            # so the process can exit cleanly instead of hanging in atexit.
+        for sub in subs_to_close:
             try:
-                import rospy
-                if rospy.core.is_initialized():
-                    self._log.info("Final shutdown: calling rospy.signal_shutdown()")
-                    rospy.signal_shutdown("agent shutdown")
+                sub.unregister()
             except Exception:
-                self._log.exception("Error during rospy.signal_shutdown()")
+                self._log.debug("Subscriber unregister failed (ignored)", exc_info=True)
+        for pub in pubs_to_close:
+            try:
+                pub.unregister()
+            except Exception:
+                self._log.debug("Publisher unregister failed (ignored)", exc_info=True)
 
-        self._log.info("ROS bridge stopped")
+        self._ros_active = False
+        self._log.info("ROS bridge deactivated")
 
-    # -- ROS setup --------------------------------------------------------
+    def _build_telemetry_cfg(self, subs: list[dict[str, str]]) -> dict[str, dict[str, Any]]:
+        return {
+            sub["telemetry_metric"]: {
+                "enabled": False,
+                "interval_s": 0.1,
+                "change_threshold_percent": 0.0,
+            }
+            for sub in subs
+        }
 
-    def _setup_ros_subscriptions(self) -> None:
+    def _create_subscription(self, sub_cfg: dict[str, str]) -> bool:
         import rospy
 
-        for sub_cfg in self._ros_subscriptions:
-            ros_topic = sub_cfg["ros_topic"]
-            msg_type_str = sub_cfg["msg_type"]
-            metric = sub_cfg["telemetry_metric"]
+        ros_topic = sub_cfg["ros_topic"]
+        msg_type_str = sub_cfg["msg_type"]
+        metric = sub_cfg["telemetry_metric"]
 
-            try:
-                msg_type = _resolve_msg_type(msg_type_str)
-            except (ImportError, AttributeError, ValueError) as exc:
-                self._log.error(
-                    "Failed to resolve msg type %s for topic %s: %s",
-                    msg_type_str, ros_topic, exc,
-                )
-                continue
-
-            def _make_callback(metric_name: str):
-                def _callback(msg: Any) -> None:
-                    data = _msg_to_dict(msg)
-                    with self._values_lock:
-                        self._latest_values[metric_name] = data
-                    if self.should_publish_telemetry(metric_name, data):
-                        if self._max_telemetry_payload_bytes is not None:
-                            encoded = json.dumps(data).encode("utf-8")
-                            if len(encoded) > self._max_telemetry_payload_bytes:
-                                self._log.warning(
-                                    "Telemetry payload for metric '%s' is %d bytes, "
-                                    "exceeds max_telemetry_payload_bytes=%d; skipping publish",
-                                    metric_name, len(encoded), self._max_telemetry_payload_bytes,
-                                )
-                                return
-                        self.publish_telemetry(metric_name, data)
-                return _callback
-
-            sub = rospy.Subscriber(ros_topic, msg_type, _make_callback(metric))
-            with self._ros_state_lock:
-                self._ros_subs.append(sub)
-            self._log.info(
-                "Subscribed ROS topic %s → telemetry/%s", ros_topic, metric,
+        try:
+            msg_type = _resolve_msg_type(msg_type_str)
+        except (ImportError, AttributeError, ValueError) as exc:
+            self._log.error(
+                "Failed to resolve msg type %s for topic %s: %s",
+                msg_type_str, ros_topic, exc,
             )
+            return False
 
-    def _setup_ros_publishers(self) -> None:
+        callback = self._make_subscription_callback(ros_topic, metric)
+        try:
+            sub = rospy.Subscriber(ros_topic, msg_type, callback)
+        except Exception:
+            self._log.exception("Failed to subscribe to %s", ros_topic)
+            return False
+
+        with self._ros_state_lock:
+            self._ros_subs[ros_topic] = sub
+            self._sub_metric_for_topic[ros_topic] = metric
+            self._sub_msg_type_str[ros_topic] = msg_type_str
+            self._sub_last_msg_at[ros_topic] = time.monotonic()
+        self._log.info("Subscribed ROS topic %s → telemetry/%s", ros_topic, metric)
+        return True
+
+    def _create_publisher(self, pub_cfg: dict[str, str]) -> bool:
         import rospy
 
-        for pub_cfg in self._ros_publishers:
-            ros_topic = pub_cfg["ros_topic"]
-            msg_type_str = pub_cfg["msg_type"]
-            command = pub_cfg["command"]
+        ros_topic = pub_cfg["ros_topic"]
+        msg_type_str = pub_cfg["msg_type"]
+        command = pub_cfg["command"]
 
-            try:
-                msg_type = _resolve_msg_type(msg_type_str)
-            except (ImportError, AttributeError, ValueError) as exc:
-                self._log.error(
-                    "Failed to resolve msg type %s for command %s: %s",
-                    msg_type_str, command, exc,
-                )
-                continue
+        try:
+            msg_type = _resolve_msg_type(msg_type_str)
+        except (ImportError, AttributeError, ValueError) as exc:
+            self._log.error(
+                "Failed to resolve msg type %s for command %s: %s",
+                msg_type_str, command, exc,
+            )
+            return False
 
+        try:
             pub = rospy.Publisher(ros_topic, msg_type, queue_size=10)
-            with self._ros_state_lock:
-                self._ros_pubs[command] = pub
-                self._pub_msg_types[command] = msg_type
-            self._log.info(
-                "ROS publisher %s ← cmd/%s", ros_topic, command,
-            )
+        except Exception:
+            self._log.exception("Failed to register publisher for %s", ros_topic)
+            return False
 
-    # -- ROS master health & reconnect -------------------------------------
+        with self._ros_state_lock:
+            self._ros_pubs[command] = pub
+            self._pub_msg_types[command] = msg_type
+        self._log.info("ROS publisher %s ← cmd/%s", ros_topic, command)
+        return True
 
-    _MASTER_HEALTH_INTERVAL_S: float = 5.0
+    def _make_subscription_callback(self, ros_topic: str, metric: str):
+        def _callback(msg: Any) -> None:
+            self._sub_last_msg_at[ros_topic] = time.monotonic()
+            data = _msg_to_dict(msg)
+            with self._values_lock:
+                self._latest_values[metric] = data
+            if self.should_publish_telemetry(metric, data):
+                if self._max_telemetry_payload_bytes is not None:
+                    encoded = json.dumps(data).encode("utf-8")
+                    if len(encoded) > self._max_telemetry_payload_bytes:
+                        self._log.warning(
+                            "Telemetry payload for metric '%s' is %d bytes, "
+                            "exceeds max_telemetry_payload_bytes=%d; skipping publish",
+                            metric, len(encoded), self._max_telemetry_payload_bytes,
+                        )
+                        return
+                self.publish_telemetry(metric, data)
+        return _callback
+
+    # -- watchdog ---------------------------------------------------------
 
     def _is_ros_master_reachable(self) -> bool:
         """Quick socket check — does not block for long."""
@@ -731,148 +790,85 @@ class RosBridgeComponent(Component):
         except (OSError, socket.timeout):
             return False
 
-    def _safe_unregister(self, subs: list[Any], pubs: list[Any]) -> None:
-        """Unregister ROS subs/pubs only if the master is reachable.
+    def _watchdog_loop(self) -> None:
+        """Self-heal subscriptions and publishers while ROS is active.
 
-        When the master is unreachable, ``unregister()`` blocks on an XML-RPC
-        call that will never return — this previously wedged the spin thread
-        on master loss and made SIGTERM time out for 90s on shutdown.
-        Skipping the call leaks the master-side registration, but the master
-        is already gone; the registration is dropped when it next restarts
-        or is overwritten on the next ``_reconnect_ros``.
+        Each tick:
+          1. If master is unreachable, skip — wait for it to come back.
+          2. For each subscriber: if no message in stale_threshold AND the
+             topic still has publishers, recreate the subscription.
+          3. For each cfg'd publisher: if missing from _ros_pubs, recreate.
         """
+        while not self._stop_event.wait(timeout=self._watchdog_interval_s):
+            try:
+                self._watchdog_tick()
+            except Exception:
+                self._log.exception("Watchdog tick failed — continuing")
+
+    def _watchdog_tick(self) -> None:
         if not self._is_ros_master_reachable():
-            if subs or pubs:
-                self._log.warning(
-                    "ROS master unreachable — skipping unregister of %d subs and %d pubs",
-                    len(subs), len(pubs),
-                )
             return
 
-        for sub in subs:
-            try:
-                sub.unregister()
-            except Exception:
-                self._log.exception("Failed to unregister ROS subscriber")
-        for pub in pubs:
-            try:
-                pub.unregister()
-            except Exception:
-                self._log.exception("Failed to unregister ROS publisher")
+        import rospy
+        try:
+            published_topics = {t for t, _ in rospy.get_published_topics()}
+        except Exception:
+            self._log.debug("Watchdog: get_published_topics failed", exc_info=True)
+            return
 
-    def _teardown_ros(self) -> None:
-        """Tear down ROS connections only — telemetry config and latest_values are preserved.
-
-        Note: between teardown and the next reconnect, the master may still
-        hold stale registrations pointing at us. Other nodes resolving these
-        topics during that window will be told we are the publisher and
-        rejected with "is not a publisher of …". Benign — they reconnect
-        once new registrations are in place.
-        """
-        if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
-            proc = self._roslaunch_proc
-            self._roslaunch_proc = None
-            self._roslaunch_state = "idle"
-            self._kill_subprocess(proc, "roslaunch", sigint_timeout=5)
+        now = time.monotonic()
+        threshold = self._subscriber_stale_threshold_s
+        recreated_any = False
 
         with self._ros_state_lock:
-            subs_to_close = list(self._ros_subs)
-            pubs_to_close = list(self._ros_pubs.values())
-            self._ros_subs.clear()
-            self._ros_pubs.clear()
-            self._pub_msg_types.clear()
+            sub_topics = list(self._ros_subs.keys())
+            sub_msg_types = dict(self._sub_msg_type_str)
+            sub_metrics = dict(self._sub_metric_for_topic)
+            sub_last = dict(self._sub_last_msg_at)
+            cfg_pub_commands = {
+                p["command"]: dict(p) for p in self._ros_publishers if p.get("command")
+            }
+            current_pubs = set(self._ros_pubs.keys())
 
-        self._safe_unregister(subs_to_close, pubs_to_close)
-
-    def _reconnect_ros(self) -> bool:
-        """Re-register ROS subs/pubs without touching telemetry or MQTT state.
-
-        Returns True on success, False if the master is unreachable or setup fails.
-        """
-        if not self._is_ros_master_reachable():
-            return False
-
-        # Initialise the ROS node once per process.  Done here (in the background
-        # spin thread) rather than in _start() so that _start() never blocks waiting
-        # for the ROS master to become available.
-        global _ros_node_initialized
-        if not _ros_node_initialized:
-            import rospy
-            rospy.init_node(self._node_name, anonymous=True, disable_signals=True)
-            _ros_node_initialized = True
-            self._log.info("ROS node '%s' initialised", self._node_name)
-
-        try:
-            self._setup_ros_subscriptions()
-            self._setup_ros_publishers()
-            self._log.info("ROS reconnected: %d subs, %d pubs", len(self._ros_subs), len(self._ros_pubs))
-            return True
-        except Exception as exc:
-            self._log.error("ROS reconnect failed: %s", exc)
-            with self._ros_state_lock:
-                subs_to_close = list(self._ros_subs)
-                pubs_to_close = list(self._ros_pubs.values())
-                self._ros_subs.clear()
-                self._ros_pubs.clear()
-                self._pub_msg_types.clear()
-            self._safe_unregister(subs_to_close, pubs_to_close)
-            return False
-
-    def _spin_loop(self) -> None:
-        """Keep ROS alive. Reconnects when master goes offline without resetting telemetry.
-
-        Reconnect is triggered by on_cmd_retry (or automatically at startup).
-        While disconnected the loop blocks until a retry command is received.
-        """
-        while not self._stop_event.is_set():
-            # Reconnect phase: wait for an explicit retry signal
-            if not self._ros_connected:
-                self._retry_event.wait()   # blocks until retry or stop
-                self._retry_event.clear()
-                if self._stop_event.is_set():
-                    break
-                try:
-                    ok = self._reconnect_ros()
-                except Exception:
-                    # Defensive: keep the spin thread alive even if reconnect raises
-                    # (e.g. rospy.init_node has already been called with different args).
-                    self._log.exception(
-                        "ROS reconnect raised — staying disconnected, send retry to try again"
-                    )
-                    ok = False
-                if ok:
-                    self._ros_connected = True
-                    self.publish_state()
-                    self._log.info("ROS bridge active")
-                else:
-                    self._log.warning(
-                        "ROS reconnect failed — send retry to try again"
-                    )
-                    self.publish_state()
+        for ros_topic in sub_topics:
+            last_seen = sub_last.get(ros_topic, 0.0)
+            if now - last_seen <= threshold:
                 continue
+            if ros_topic not in published_topics:
+                continue
+            self._log.warning(
+                "Watchdog: subscription %s has no messages for %.1fs but topic has "
+                "publishers — recreating",
+                ros_topic, now - last_seen,
+            )
+            with self._ros_state_lock:
+                sub = self._ros_subs.pop(ros_topic, None)
+                self._sub_last_msg_at.pop(ros_topic, None)
+            if sub is not None:
+                try:
+                    sub.unregister()
+                except Exception:
+                    self._log.debug("Stale sub unregister failed (ignored)", exc_info=True)
+            self._create_subscription({
+                "ros_topic": ros_topic,
+                "msg_type": sub_msg_types.get(ros_topic, ""),
+                "telemetry_metric": sub_metrics.get(ros_topic, _topic_to_metric(ros_topic)),
+            })
+            recreated_any = True
 
-            # Spin phase: periodic master health checks. Also exits if an
-            # external cmd/retry flips _ros_connected to False — without that
-            # check, a fast master reboot (under MASTER_HEALTH_INTERVAL_S)
-            # would leave the retry signal stranded here.
-            while not self._stop_event.is_set() and self._ros_connected:
-                if not self._stop_event.wait(timeout=self._MASTER_HEALTH_INTERVAL_S):
-                    # Timeout expired — check master
-                    if not self._is_ros_master_reachable():
-                        break  # master down → teardown and wait for retry
+        for command, pub_cfg in cfg_pub_commands.items():
+            if command in current_pubs:
+                continue
+            self._log.warning(
+                "Watchdog: publisher for cmd/%s missing — recreating", command,
+            )
+            self._create_publisher(pub_cfg)
+            recreated_any = True
 
-            if self._stop_event.is_set():
-                break
+        if recreated_any:
+            self.publish_state()
 
-            if self._ros_connected:
-                # Inner loop exited because the master went down.
-                self._log.warning("ROS master unreachable — tearing down connections")
-                self._teardown_ros()
-                self._ros_connected = False
-                self.publish_state()
-            # else: external retry already tore down and flipped the flag.
-
-    # -- retained publishing -----------------------------------------------
+    # -- retained publishing ----------------------------------------------
 
     def _publish_all_retained(self) -> None:
         self.publish_metadata()
@@ -881,18 +877,42 @@ class RosBridgeComponent(Component):
         self.publish_state()
         self.publish_cfg()
 
+    # -- helpers -----------------------------------------------------------
+
+    def _require_ros_active(self, action: str, request_id: str) -> bool:
+        if self._ros_active:
+            return True
+        self.publish_result(
+            action, request_id, ok=False,
+            error="ros_bridge idle — call cmd/start_ros first",
+        )
+        return False
+
+    def _subprocess_env(self) -> dict[str, str] | None:
+        """Build env for roslaunch/rosbag subprocesses, applying ros_env + display.
+
+        Returns None when neither override is set, so subprocess.Popen inherits
+        the agent process env unchanged.
+        """
+        if not self._ros_env and not self._display:
+            return None
+        env = {**os.environ, **self._ros_env}
+        if self._display:
+            env["DISPLAY"] = self._display
+        return env
+
     # -- command handlers --------------------------------------------------
 
-    def on_cmd_reset(self, payload_str: str) -> None:
-        """Handle cmd/reset → evt/reset/result.
+    def on_cmd_ping(self, payload_str: str) -> None:
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+        except json.JSONDecodeError:
+            request_id = ""
+        self.publish_result("ping", request_id, ok=True, error=None)
 
-        Always performs a full stop-then-start cycle so that ROS subscriptions
-        and publishers are re-registered with the current roscore.  This is
-        required after roscore is restarted, because the previous rospy
-        connections are silently orphaned even though the component status
-        remains RUNNING (the spin thread exits when ROS shuts down but nothing
-        marks the component as stopped).
-        """
+    def on_cmd_reset(self, payload_str: str) -> None:
+        """Clear cached latest_values. Does not touch the ROS layer."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -902,66 +922,58 @@ class RosBridgeComponent(Component):
         with self._values_lock:
             self._latest_values.clear()
 
-        try:
-            if self._state.status == ComponentStatus.RUNNING:
-                self.stop()
-            self.start()
-        except Exception as exc:
-            self.publish_result("reset", request_id, ok=False, error=str(exc))
-            return
-
         self.publish_state()
         self.publish_result("reset", request_id, ok=True, error=None)
 
-    def on_cmd_ping(self, payload_str: str) -> None:
-        """Handle cmd/ping → evt/ping/result."""
+    def on_cmd_start_ros(self, payload_str: str) -> None:
+        """Activate the ROS layer. Idempotent."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
         except json.JSONDecodeError:
             request_id = ""
-        self.publish_result("ping", request_id, ok=True, error=None)
 
-    def on_cmd_retry(self, payload_str: str) -> None:
-        """Handle cmd/retry → trigger a ROS master reconnect attempt.
-
-        Wakes the spin loop to attempt reconnect immediately. No-op if already
-        connected, unless ``force`` is true — in that case, subs/pubs are
-        unregistered and re-registered without clearing latest_values or
-        touching the roslaunch. Use after a docker restart where the ROS master
-        is still reachable but registrations are stale.
-
-        Result is published immediately; state update follows once the attempt completes.
-        """
-        try:
-            payload = json.loads(payload_str) if payload_str else {}
-            request_id = payload.get("request_id", "")
-            force = bool(payload.get("force", False))
-        except json.JSONDecodeError:
-            request_id = ""
-            force = False
-
-        if self._ros_connected and not force:
-            self.publish_result("retry", request_id, ok=True, error="already connected")
+        if self._ros_active:
+            self.publish_result("start_ros", request_id, ok=True, error=None)
             return
 
-        if force:
-            # Tear down stale ROS registrations — roslaunch and latest_values preserved
-            with self._ros_state_lock:
-                subs_to_close = list(self._ros_subs)
-                pubs_to_close = list(self._ros_pubs.values())
-                self._ros_subs.clear()
-                self._ros_pubs.clear()
-                self._pub_msg_types.clear()
-            self._safe_unregister(subs_to_close, pubs_to_close)
-            self._ros_connected = False
-            self.publish_state()
+        try:
+            self._activate_ros()
+        except Exception as exc:
+            self._log.exception("start_ros failed")
+            try:
+                self._deactivate_ros()
+            except Exception:
+                self._log.debug("cleanup after failed start_ros", exc_info=True)
+            self.publish_result("start_ros", request_id, ok=False, error=str(exc))
+            return
 
-        self._retry_event.set()
-        self.publish_result("retry", request_id, ok=True, error=None)
+        self.publish_state()
+        self.publish_result("start_ros", request_id, ok=True, error=None)
+
+    def on_cmd_stop_ros(self, payload_str: str) -> None:
+        """Deactivate the ROS layer. Idempotent."""
+        try:
+            payload = json.loads(payload_str) if payload_str else {}
+            request_id = payload.get("request_id", "")
+        except json.JSONDecodeError:
+            request_id = ""
+
+        if not self._ros_active:
+            self.publish_result("stop_ros", request_id, ok=True, error=None)
+            return
+
+        try:
+            self._deactivate_ros()
+        except Exception as exc:
+            self._log.exception("stop_ros failed")
+            self.publish_result("stop_ros", request_id, ok=False, error=str(exc))
+            return
+
+        self.publish_state()
+        self.publish_result("stop_ros", request_id, ok=True, error=None)
 
     def on_cmd_cfg_set(self, payload_str: str) -> None:
-        """Handle cmd/cfg/set → evt/cfg/set/result."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -983,7 +995,6 @@ class RosBridgeComponent(Component):
         applied: dict[str, Any] = {}
         rejected: dict[str, str] = {}
 
-        # Takes effect immediately
         if "node_name" in set_dict:
             self._node_name = str(set_dict["node_name"])
             applied["node_name"] = self._node_name
@@ -1009,6 +1020,41 @@ class RosBridgeComponent(Component):
             else:
                 rejected["exclude_topics"] = "must be a list of topic strings"
 
+        if "watchdog_interval_s" in set_dict:
+            try:
+                val = float(set_dict["watchdog_interval_s"])
+            except (TypeError, ValueError):
+                rejected["watchdog_interval_s"] = "must be a number"
+            else:
+                if val <= 0:
+                    rejected["watchdog_interval_s"] = "must be > 0"
+                else:
+                    self._watchdog_interval_s = val
+                    applied["watchdog_interval_s"] = self._watchdog_interval_s
+
+        if "subscriber_stale_threshold_s" in set_dict:
+            try:
+                val = float(set_dict["subscriber_stale_threshold_s"])
+            except (TypeError, ValueError):
+                rejected["subscriber_stale_threshold_s"] = "must be a number"
+            else:
+                if val <= 0:
+                    rejected["subscriber_stale_threshold_s"] = "must be > 0"
+                else:
+                    self._subscriber_stale_threshold_s = val
+                    applied["subscriber_stale_threshold_s"] = self._subscriber_stale_threshold_s
+
+        if "display" in set_dict:
+            raw = set_dict["display"]
+            if raw is None or raw == "":
+                self._display = None
+                applied["display"] = None
+            elif isinstance(raw, str):
+                self._display = raw
+                applied["display"] = self._display
+            else:
+                rejected["display"] = "must be a string or null"
+
         if "roslaunch" in set_dict:
             rl = set_dict["roslaunch"]
             if isinstance(rl, dict):
@@ -1024,15 +1070,14 @@ class RosBridgeComponent(Component):
             else:
                 rejected["roslaunch"] = "must be an object"
 
-        # Cannot change at runtime — restart required
         for key in ("ros_subscriptions", "ros_publishers"):
             if key in set_dict:
                 rejected[key] = "cannot be changed at runtime; restart required"
 
-        # Unknown keys
         known_keys = {
             "node_name", "auto_discover", "max_auto_discover_publishers",
             "max_telemetry_payload_bytes", "exclude_topics",
+            "watchdog_interval_s", "subscriber_stale_threshold_s", "display",
             "ros_subscriptions", "ros_publishers", "roslaunch",
         }
         for key in set_dict:
@@ -1049,7 +1094,7 @@ class RosBridgeComponent(Component):
             ts=_utc_iso(),
         )
 
-    # -- subprocess helpers -------------------------------------------------
+    # -- subprocess helpers ------------------------------------------------
 
     def _kill_subprocess(
         self,
@@ -1072,7 +1117,7 @@ class RosBridgeComponent(Component):
             pass
         return proc.returncode
 
-    # -- roslaunch command handlers -----------------------------------------
+    # -- roslaunch command handlers ----------------------------------------
 
     def _do_roslaunch_start(
         self,
@@ -1083,7 +1128,6 @@ class RosBridgeComponent(Component):
         request_id: str = "",
         publish_result: bool = True,
     ) -> bool:
-        """Launch a roslaunch subprocess. Auto-stops any running launch first. Returns True on success."""
         if not package or not launch_file:
             if publish_result:
                 self.publish_result(
@@ -1092,7 +1136,6 @@ class RosBridgeComponent(Component):
                 )
             return False
 
-        # Auto-swap: if a launch is already running, stop it first
         if self._roslaunch_proc is not None and self._roslaunch_proc.poll() is None:
             self._log.info(
                 "roslaunch already running (%s), stopping to start %s",
@@ -1111,15 +1154,13 @@ class RosBridgeComponent(Component):
         self._log.info("Starting roslaunch: %s", " ".join(cmd_parts))
         self._roslaunch_state = "launching"
 
-        subprocess_env = {**os.environ, **self._ros_env} if self._ros_env else None
-
         try:
             self._roslaunch_proc = subprocess.Popen(
                 cmd_parts,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
-                env=subprocess_env,
+                env=self._subprocess_env(),
             )
         except FileNotFoundError as exc:
             self._roslaunch_state = "idle"
@@ -1132,13 +1173,11 @@ class RosBridgeComponent(Component):
         if publish_result:
             self.publish_result("roslaunch_start", request_id, ok=True, error=None)
 
-        # Monitor thread: updates state if roslaunch exits on its own
         def _monitor() -> None:
             proc = self._roslaunch_proc
             if proc is not None:
                 proc.wait()
                 rc = proc.returncode
-                # Only update state if stop() hasn't already claimed ownership
                 if self._roslaunch_proc is proc:
                     self._roslaunch_proc = None
                     self._roslaunch_state = "exited"
@@ -1149,7 +1188,6 @@ class RosBridgeComponent(Component):
         return True
 
     def on_cmd_roslaunch_start(self, payload_str: str) -> None:
-        """Start a roslaunch subprocess. Uses YAML config as defaults; payload overrides."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -1157,16 +1195,17 @@ class RosBridgeComponent(Component):
         except json.JSONDecodeError:
             request_id, data = "", {}
 
+        if not self._require_ros_active("roslaunch_start", request_id):
+            return
+
         package = data.get("package", "") or self._roslaunch_package
         launch_file = data.get("launch_file", "") or self._roslaunch_launch_file
 
-        # Merge args: config defaults + payload overrides
         args = dict(self._roslaunch_args)
         payload_args = data.get("args", "")
         if isinstance(payload_args, dict):
             args.update({str(k): str(v) for k, v in payload_args.items()})
         elif isinstance(payload_args, str) and payload_args.strip():
-            # Backward compat: parse "key:=value" pairs from string
             for token in shlex.split(payload_args):
                 if ":=" in token:
                     k, _, v = token.partition(":=")
@@ -1180,7 +1219,6 @@ class RosBridgeComponent(Component):
         ).start()
 
     def on_cmd_roslaunch_stop(self, payload_str: str) -> None:
-        """Stop the running roslaunch subprocess (async — does not block MQTT thread)."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -1193,7 +1231,7 @@ class RosBridgeComponent(Component):
 
         self._roslaunch_state = "stopping"
         proc = self._roslaunch_proc
-        self._roslaunch_proc = None  # prevent double-stop
+        self._roslaunch_proc = None
         self.publish_state()
 
         def _do_stop() -> None:
@@ -1204,16 +1242,18 @@ class RosBridgeComponent(Component):
 
         threading.Thread(target=_do_stop, daemon=True).start()
 
-    # -- rosbag command handlers --------------------------------------------
+    # -- rosbag command handlers -------------------------------------------
 
     def on_cmd_rosbag_start(self, payload_str: str) -> None:
-        """Start a rosbag record subprocess."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
             data = payload.get("data", payload)
         except json.JSONDecodeError:
             request_id, data = "", {}
+
+        if not self._require_ros_active("rosbag_start", request_id):
+            return
 
         if self._rosbag_proc is not None and self._rosbag_proc.poll() is None:
             self.publish_result("rosbag_start", request_id, ok=False, error="Already recording")
@@ -1225,9 +1265,7 @@ class RosBridgeComponent(Component):
             raw_out = "data"
         elif not isinstance(raw_out, str):
             self.publish_result(
-                "rosbag_start",
-                request_id,
-                ok=False,
+                "rosbag_start", request_id, ok=False,
                 error="output_dir must be a string",
             )
             return
@@ -1245,9 +1283,7 @@ class RosBridgeComponent(Component):
                 raw_out, out_dir,
             )
             self.publish_result(
-                "rosbag_start",
-                request_id,
-                ok=False,
+                "rosbag_start", request_id, ok=False,
                 error=f"output_dir must be an existing directory: {out_dir}",
             )
             return
@@ -1270,15 +1306,13 @@ class RosBridgeComponent(Component):
 
         self._log.info("Starting rosbag: %s", " ".join(cmd))
 
-        subprocess_env = {**os.environ, **self._ros_env} if self._ros_env else None
-
         try:
             self._rosbag_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,
-                env=subprocess_env,
+                env=self._subprocess_env(),
             )
         except FileNotFoundError as exc:
             self._rosbag_state = "idle"
@@ -1290,7 +1324,6 @@ class RosBridgeComponent(Component):
         self.publish_result("rosbag_start", request_id, ok=True, error=None)
 
     def on_cmd_rosbag_stop(self, payload_str: str) -> None:
-        """Stop the running rosbag record subprocess."""
         try:
             payload = json.loads(payload_str) if payload_str else {}
             request_id = payload.get("request_id", "")
@@ -1313,7 +1346,7 @@ class RosBridgeComponent(Component):
         self.publish_result("rosbag_stop", request_id, ok=True, error=None)
         self._log.info("rosbag stopped: %s (%.1fs, %.1fMB)", bag_file, duration_s, size_mb)
 
-    # -- ROS topic publish handler ------------------------------------------
+    # -- ROS topic publish handler -----------------------------------------
 
     def handle_ros_publish(self, command: str, payload_str: str) -> None:
         """Handle a LUCID command that maps to a ROS topic publish.
@@ -1327,6 +1360,9 @@ class RosBridgeComponent(Component):
         except json.JSONDecodeError:
             request_id = ""
             data = {}
+
+        if not self._require_ros_active(command, request_id):
+            return
 
         with self._ros_state_lock:
             pub = self._ros_pubs.get(command)
@@ -1345,9 +1381,6 @@ class RosBridgeComponent(Component):
             self._log.info("Published to ROS via cmd/%s", command)
             self.publish_result(command, request_id, ok=True, error=None)
         except Exception as exc:
-            # "publish() to a closed topic" is expected during retry/teardown
-            # windows — demote to debug. Other errors (serialization, etc.)
-            # surface as errors.
             if "closed topic" in str(exc).lower():
                 self._log.debug("cmd/%s skipped: %s", command, exc)
             else:
@@ -1358,11 +1391,11 @@ class RosBridgeComponent(Component):
         """Route on_cmd_<command> calls to handle_ros_publish for configured publishers.
 
         Checks against _ros_publisher_commands (built from config at __init__ time) so
-        that the agent can subscribe to these cmd topics at startup — before the ROS
-        spin loop connects and populates _ros_pubs.
+        the agent can subscribe to these cmd topics at startup — even before start_ros
+        has run and populated _ros_pubs.
         """
         if name.startswith("on_cmd_"):
-            command = name[7:]  # strip "on_cmd_"
+            command = name[7:]
             if command in self._ros_publisher_commands:
                 def _handler(payload_str: str) -> None:
                     self.handle_ros_publish(command, payload_str)
