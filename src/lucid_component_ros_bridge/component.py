@@ -415,7 +415,7 @@ class RosBridgeComponent(Component):
 
     def capabilities(self) -> list[str]:
         caps = [
-            "ping", "reset", "start_ros", "stop_ros",
+            "ping", "reset", "start-ros", "stop-ros",
             "roslaunch-start", "roslaunch-stop",
             "rosbag-start", "rosbag-stop",
         ]
